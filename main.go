@@ -8,12 +8,12 @@ import (
 
 var (
 	addr   = flag.String("addr", "127.0.0.1:8080", "server address")
-	script = flag.String("script", "", "script")
+	config = flag.String("config", "", "config")
 	token  = flag.String("token", "", "token")
 )
 
 func main() {
 	flag.Parse()
 
-	internal.Run(*addr, *token, *script)
+	internal.Run(*addr, *token, *config)
 }
