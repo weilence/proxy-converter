@@ -4,4 +4,4 @@ NAME = proxy-converter
 
 build:
 	@echo "Building the project"
-	@go build -o $(NAME) main.go
+	@cargo build --release

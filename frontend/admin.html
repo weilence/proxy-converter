@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>proxy-converter · 管理后台</title>
+<style>
+:root {
+  --bg: #f3f5f8; --card: #ffffff; --border: #e4e8ee; --text: #1c2430;
+  --muted: #77808c; --primary: #2f6fed; --primary-dark: #1f5bd6;
+  --green: #15803d; --green-bg: #e7f6ec; --amber: #b45309; --amber-bg: #fdf1de;
+  --gray: #5b6470; --gray-bg: #eceff3; --red: #d92d20;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; color: var(--text); background: var(--bg);
+  font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.hidden { display: none !important; }
+
+.login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.login-card {
+  width: 100%; max-width: 360px; padding: 32px; background: var(--card);
+  border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 8px 30px rgba(28, 36, 48, 0.06);
+}
+.login-card h1 { margin: 0 0 4px; font-size: 20px; }
+.login-card .sub { margin: 0 0 24px; color: var(--muted); font-size: 13px; }
+
+label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+input {
+  width: 100%; padding: 9px 12px; font-size: 14px; color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; background: #fbfcfe; outline: none;
+}
+input:focus { border-color: var(--primary); background: #fff; box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.15); }
+button {
+  border: none; border-radius: 8px; font-size: 14px; cursor: pointer;
+  padding: 9px 16px; color: #fff; background: var(--primary);
+}
+button:hover { background: var(--primary-dark); }
+button.secondary { background: var(--gray-bg); color: var(--gray); }
+button.secondary:hover { background: #dfe3e9; }
+button.danger { background: #fff; color: var(--red); border: 1px solid #f4b5b0; }
+button.danger:hover { background: #fef1f0; }
+
+.wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 64px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+.topbar h1 { margin: 0; font-size: 20px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 20px; }
+.add-form { display: grid; grid-template-columns: 2fr 2fr 1fr auto; gap: 12px; align-items: end; }
+@media (max-width: 720px) { .add-form { grid-template-columns: 1fr; } }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+tr:last-child td { border-bottom: none; }
+td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.empty { text-align: center; color: var(--muted); padding: 28px 0; }
+
+.badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; }
+.badge.valid { color: var(--green); background: var(--green-bg); }
+.badge.expired { color: var(--amber); background: var(--amber-bg); }
+.badge.disabled { color: var(--gray); background: var(--gray-bg); }
+
+.actions { display: flex; gap: 8px; }
+.actions button { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+
+#toast {
+  position: fixed; left: 50%; bottom: 32px; transform: translateX(-50%) translateY(20px);
+  background: #1c2430; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px;
+  opacity: 0; pointer-events: none; transition: all 0.25s ease;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+#toast.error { background: var(--red); }
+</style>
+</head>
+<body>
+
+<div id="login-view" class="login-wrap hidden">
+  <form class="login-card" id="login-form">
+    <h1>proxy-converter</h1>
+    <p class="sub">管理后台 · 请输入管理员密码</p>
+    <label for="password">密码</label>
+    <input id="password" type="password" autocomplete="current-password" required autofocus />
+    <div style="margin-top:16px;">
+      <button type="submit" style="width:100%">登 录</button>
+    </div>
+    <p id="login-error" style="color:var(--red); font-size:13px; min-height:18px; margin:12px 0 0;"></p>
+  </form>
+</div>
+
+<div id="panel-view" class="wrap hidden">
+  <div class="topbar">
+    <h1>令牌管理</h1>
+    <button id="logout-btn" class="secondary" type="button">退出登录</button>
+  </div>
+
+  <form class="card add-form" id="add-form">
+    <div>
+      <label for="new-token">令牌 *</label>
+      <input id="new-token" placeholder="例如 my-secret-token" required />
+    </div>
+    <div>
+      <label for="new-name">备注</label>
+      <input id="new-name" placeholder="例如 家里的设备" />
+    </div>
+    <div>
+      <label for="new-days">有效天数</label>
+      <input id="new-days" type="number" min="0" placeholder="留空=永久" />
+    </div>
+    <button type="submit">添加令牌</button>
+  </form>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>令牌</th><th>备注</th><th>状态</th>
+          <th>过期时间</th><th>最近使用</th><th>创建时间</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="token-body"></tbody>
+    </table>
+    <div id="empty-hint" class="empty hidden">还没有令牌，先添加一个吧。</div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[c]));
+
+let toastTimer;
+function toast(message, isError = false) {
+  const el = $('#toast');
+  el.textContent = message;
+  el.className = isError ? 'error show' : 'show';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ''; }, 2200);
+}
+
+async function api(url, options = {}) {
+  const res = await fetch(url, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  if (res.status === 401) {
+    showLogin();
+    throw new Error('未登录或会话已过期');
+  }
+  return res;
+}
+
+function showLogin() {
+  $('#panel-view').classList.add('hidden');
+  $('#login-view').classList.remove('hidden');
+  $('#password').focus();
+}
+
+function showPanel() {
+  $('#login-view').classList.add('hidden');
+  $('#panel-view').classList.remove('hidden');
+  loadTokens();
+}
+
+$('#login-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const res = await fetch('/admin/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: $('#password').value }),
+  });
+  if (res.ok) {
+    $('#login-error').textContent = '';
+    $('#password').value = '';
+    showPanel();
+  } else {
+    $('#login-error').textContent = res.status === 401 ? '密码错误' : `登录失败 (${res.status})`;
+  }
+});
+
+$('#logout-btn').addEventListener('click', async () => {
+  try { await api('/admin/api/logout', { method: 'POST' }); } catch {}
+  showLogin();
+});
+
+const STATUS_LABEL = { valid: '有效', expired: '已过期', disabled: '已停用' };
+
+async function loadTokens() {
+  let tokens;
+  try {
+    const res = await api('/admin/api/tokens');
+    tokens = await res.json();
+  } catch (err) {
+    return;
+  }
+
+  $('#token-body').innerHTML = tokens.map((t) => `
+    <tr>
+      <td>${t.id}</td>
+      <td class="mono">${esc(t.token)}</td>
+      <td>${esc(t.name) || '-'}</td>
+      <td><span class="badge ${esc(t.status)}">${STATUS_LABEL[t.status] || esc(t.status)}</span></td>
+      <td>${esc(t.expires_at)}</td>
+      <td>${esc(t.last_used_at)}</td>
+      <td>${esc(t.created_at)}</td>
+      <td>
+        <div class="actions">
+          ${t.status === 'disabled'
+            ? `<button class="secondary" onclick="enableToken(${t.id})">启用</button>`
+            : `<button class="secondary" onclick="disableToken(${t.id})">停用</button>`}
+          <button class="danger" onclick="removeToken(${t.id}, ${esc(JSON.stringify(t.token))})">删除</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+
+  $('#empty-hint').classList.toggle('hidden', tokens.length > 0);
+}
+
+$('#add-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const token = $('#new-token').value.trim();
+  const name = $('#new-name').value.trim();
+  const daysRaw = $('#new-days').value.trim();
+  if (!token) return;
+
+  const body = JSON.stringify({ token, name, days: daysRaw === '' ? null : Number(daysRaw) });
+  let res;
+  try {
+    res = await api('/admin/api/tokens', { method: 'POST', body });
+  } catch (err) { toast(err.message, true); return; }
+
+  if (res.ok) {
+    toast('令牌已添加');
+    $('#new-token').value = '';
+    $('#new-name').value = '';
+    $('#new-days').value = '';
+    loadTokens();
+  } else if (res.status === 409) {
+    toast('令牌已存在', true);
+  } else {
+    toast(`添加失败 (${res.status})`, true);
+  }
+});
+
+async function toggleEnabled(id, enabled) {
+  try {
+    const res = await api(`/admin/api/tokens/${id}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' });
+    if (res.ok) { toast(enabled ? '已启用' : '已停用'); loadTokens(); }
+    else if (res.status === 404) toast('令牌不存在', true);
+    else toast('操作失败', true);
+  } catch (err) { toast(err.message, true); }
+}
+
+async function enableToken(id) { await toggleEnabled(id, true); }
+async function disableToken(id) { await toggleEnabled(id, false); }
+
+async function removeToken(id, token) {
+  if (!confirm(`确定删除令牌「${token}」吗？删除后立即失效。`)) return;
+  try {
+    const res = await api(`/admin/api/tokens/${id}`, { method: 'DELETE' });
+    if (res.ok) { toast('已删除'); loadTokens(); }
+    else if (res.status === 404) toast('令牌不存在', true);
+    else toast('删除失败', true);
+  } catch (err) { toast(err.message, true); }
+}
+
+// Probe the API to decide which view to show.
+(async () => {
+  try {
+    const res = await fetch('/admin/api/tokens');
+    if (res.ok) showPanel();
+    else showLogin();
+  } catch {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>
