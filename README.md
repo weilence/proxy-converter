@@ -78,6 +78,39 @@ journalctl -u proxy-converter -f      # 查看日志
 监听地址、数据库路径等按需修改 unit 文件中的 `ExecStart` 后执行
 `sudo systemctl restart proxy-converter`。
 
+### 在 macOS 上交叉编译 linux/amd64
+
+一次性准备：
+
+```sh
+brew install messense/macos-cross-toolchains/x86_64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl
+```
+
+并把下面的配置写入 `~/.cargo/config.toml`（机器级配置，不随仓库走；若文件已有内容则追加）：
+
+```toml
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-unknown-linux-musl-gcc"
+
+[env]
+CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc"
+AR_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-ar"
+```
+
+构建：
+
+```sh
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+产物 `target/x86_64-unknown-linux-musl/release/proxy-converter` 为全静态二进制，
+不依赖目标机任何库，scp 到任意 x86_64 Linux 即可运行。
+
+> 仓库本身不携带任何交叉编译配置：在 Linux 上直接 `cargo build --release` 原生构建即可；
+> 如确需在 Linux 上编 musl 目标，安装 `musl-tools` 后以环境变量指定
+> `CC_x86_64_unknown_linux_musl=musl-gcc` 和 `CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc`。
+
 ## 日志
 
 默认输出 `info` 级别日志，可通过 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=debug`。
