@@ -3,8 +3,8 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use chrono::{Local, Utc};
 use sea_orm::{
-    prelude::DateTime, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, Database,
-    DatabaseBackend, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set, Statement,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, Database, DatabaseBackend,
+    DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set, Statement, prelude::DateTime,
 };
 
 use crate::entity::token;
@@ -13,6 +13,7 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS tokens (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     token        TEXT NOT NULL UNIQUE,
     name         TEXT NOT NULL DEFAULT '',
+    config       TEXT NOT NULL DEFAULT '',
     enabled      INTEGER NOT NULL DEFAULT 1,
     expires_at   TEXT,
     created_at   TEXT NOT NULL,
@@ -38,8 +39,9 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// Check whether a token is currently valid and record its use.
-    pub async fn verify(&self, token: &str) -> bool {
+    /// Check whether a token is currently valid; on success return its
+    /// record and mark its use.
+    pub async fn verify(&self, token: &str) -> Option<token::Model> {
         let found = token::Entity::find()
             .filter(token::Column::Token.eq(token))
             .filter(token::Column::Enabled.eq(true))
@@ -49,11 +51,11 @@ impl Db {
                     .add(token::Column::ExpiresAt.gt(now())),
             )
             .one(&self.conn)
-            .await;
+            .await
+            .ok()
+            .flatten();
 
-        let valid = matches!(found, Ok(Some(_)));
-
-        if valid {
+        if found.is_some() {
             let _ = token::Entity::update_many()
                 .filter(token::Column::Token.eq(token))
                 .set(token::ActiveModel {
@@ -64,11 +66,18 @@ impl Db {
                 .await;
         }
 
-        valid
+        found
     }
 
     /// Insert a token; returns `false` when it already exists.
-    pub async fn add(&self, token: &str, name: &str, days: Option<i64>) -> Result<bool> {
+    pub async fn add(
+        &self,
+        token: &str,
+        name: &str,
+        days: Option<i64>,
+        config: &str,
+    ) -> Result<bool> {
+        let config = normalize_config(config)?;
         if token::Entity::find()
             .filter(token::Column::Token.eq(token))
             .one(&self.conn)
@@ -81,6 +90,7 @@ impl Db {
         token::ActiveModel {
             token: Set(token.to_owned()),
             name: Set(name.to_owned()),
+            config: Set(config),
             enabled: Set(true),
             expires_at: Set(days.map(|days| now() + chrono::Duration::days(days))),
             created_at: Set(now()),
@@ -94,18 +104,8 @@ impl Db {
         Ok(true)
     }
 
-    /// Delete a token; returns the number of removed rows.
-    pub async fn remove(&self, token: &str) -> Result<u64> {
-        token::Entity::delete_many()
-            .filter(token::Column::Token.eq(token))
-            .exec(&self.conn)
-            .await
-            .map(|result| result.rows_affected)
-            .context("failed to delete the token")
-    }
-
     /// Delete a token by id; returns the number of removed rows.
-    pub async fn remove_by_id(&self, id: i32) -> Result<u64> {
+    pub async fn remove(&self, id: i32) -> Result<u64> {
         token::Entity::delete_by_id(id)
             .exec(&self.conn)
             .await
@@ -113,10 +113,10 @@ impl Db {
             .context("failed to delete the token")
     }
 
-    /// Enable or disable a token; returns the number of updated rows.
-    pub async fn set_enabled(&self, token: &str, enabled: bool) -> Result<u64> {
+    /// Enable or disable a token by id; returns the number of updated rows.
+    pub async fn set_enabled(&self, id: i32, enabled: bool) -> Result<u64> {
         token::Entity::update_many()
-            .filter(token::Column::Token.eq(token))
+            .filter(token::Column::Id.eq(id))
             .set(token::ActiveModel {
                 enabled: Set(enabled),
                 ..Default::default()
@@ -127,12 +127,13 @@ impl Db {
             .context("failed to update the token")
     }
 
-    /// Enable or disable a token by id; returns the number of updated rows.
-    pub async fn set_enabled_by_id(&self, id: i32, enabled: bool) -> Result<u64> {
+    /// Bind config content to a token by id; returns the number of updated rows.
+    pub async fn set_config(&self, id: i32, config: &str) -> Result<u64> {
+        let config = normalize_config(config)?;
         token::Entity::update_many()
             .filter(token::Column::Id.eq(id))
             .set(token::ActiveModel {
-                enabled: Set(enabled),
+                config: Set(config),
                 ..Default::default()
             })
             .exec(&self.conn)
@@ -160,7 +161,10 @@ pub fn now() -> DateTime {
 pub fn token_status(record: &token::Model, now: DateTime) -> &'static str {
     if !record.enabled {
         "disabled"
-    } else if record.expires_at.is_some_and(|expires_at| expires_at <= now) {
+    } else if record
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
         "expired"
     } else {
         "valid"
@@ -177,6 +181,20 @@ pub fn fmt_datetime(datetime: Option<DateTime>, none: &str) -> String {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string(),
     }
+}
+
+/// Check that config content parses as YAML; an empty string is allowed and
+/// means "no config bound".
+pub fn validate_config(config: &str) -> Result<()> {
+    serde_yaml::from_str::<serde_yaml::Value>(config)
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("the config is not valid YAML: {err}"))
+}
+
+fn normalize_config(config: &str) -> Result<String> {
+    let config = config.trim();
+    validate_config(config)?;
+    Ok(config.to_owned())
 }
 
 /// Create the table for fresh databases, or upgrade the legacy schema
@@ -208,6 +226,8 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
         .is_some();
 
     if has_id {
+        // v0.2: tokens gained a bound config served by `/convert`.
+        add_config_column_if_missing(conn).await?;
         return Ok(());
     }
 
@@ -227,6 +247,25 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
         conn.execute_unprepared(&statement)
             .await
             .context("failed to migrate the `tokens` table")?;
+    }
+
+    Ok(())
+}
+
+async fn add_config_column_if_missing(conn: &DatabaseConnection) -> Result<()> {
+    let has_config = conn
+        .query_one(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT 1 FROM pragma_table_info('tokens') WHERE name = 'config'".to_owned(),
+        ))
+        .await
+        .context("failed to inspect the `tokens` table")?
+        .is_some();
+
+    if !has_config {
+        conn.execute_unprepared("ALTER TABLE tokens ADD COLUMN config TEXT NOT NULL DEFAULT ''")
+            .await
+            .context("failed to add the `config` column")?;
     }
 
     Ok(())

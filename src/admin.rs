@@ -5,11 +5,11 @@ use std::{
 };
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -51,12 +51,16 @@ pub fn routes() -> Router<AppState> {
         .route("/admin/api/tokens", get(list_tokens).post(add_token))
         .route("/admin/api/tokens/{id}/enable", post(enable_token))
         .route("/admin/api/tokens/{id}/disable", post(disable_token))
+        .route("/admin/api/tokens/{id}/config", post(set_token_config))
         .route("/admin/api/tokens/{id}", delete(remove_token))
 }
 
 async fn page(State(state): State<AppState>) -> Response {
     if !state.admin.enabled() {
-        return (StatusCode::NOT_FOUND, "admin page is disabled; set ADMIN_PASSWORD to enable")
+        return (
+            StatusCode::NOT_FOUND,
+            "admin page is disabled; set ADMIN_PASSWORD to enable",
+        )
             .into_response();
     }
     Html(include_str!("../frontend/admin.html")).into_response()
@@ -86,7 +90,10 @@ async fn login(State(state): State<AppState>, Json(payload): Json<LoginPayload>)
     let mut response = Json(json!({ "ok": true })).into_response();
     set_cookie(
         &mut response,
-        &format!("{SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}", SESSION_TTL.as_secs()),
+        &format!(
+            "{SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+            SESSION_TTL.as_secs()
+        ),
     );
     response
 }
@@ -111,6 +118,7 @@ struct TokenJson {
     id: i32,
     token: String,
     name: String,
+    config: String,
     status: &'static str,
     expires_at: String,
     last_used_at: String,
@@ -123,6 +131,7 @@ impl TokenJson {
             id: record.id,
             token: record.token.clone(),
             name: record.name.clone(),
+            config: record.config.clone(),
             status: db::token_status(record, db::now()),
             expires_at: db::fmt_datetime(record.expires_at, "never"),
             last_used_at: db::fmt_datetime(record.last_used_at, "-"),
@@ -150,6 +159,7 @@ struct AddTokenPayload {
     token: String,
     name: Option<String>,
     days: Option<i64>,
+    config: Option<String>,
 }
 
 async fn add_token(
@@ -170,9 +180,39 @@ async fn add_token(
     }
 
     let name = payload.name.unwrap_or_default().trim().to_owned();
-    match state.db.add(&token, &name, payload.days).await {
+    let config = payload.config.unwrap_or_default();
+    if let Err(err) = db::validate_config(config.trim()) {
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+    }
+    match state.db.add(&token, &name, payload.days, &config).await {
         Ok(true) => (StatusCode::CREATED, "added").into_response(),
         Ok(false) => (StatusCode::CONFLICT, "token already exists").into_response(),
+        Err(err) => internal(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetConfigPayload {
+    config: String,
+}
+
+async fn set_token_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+    Json(payload): Json<SetConfigPayload>,
+) -> Response {
+    if let Err(response) = guard(&state, &headers) {
+        return response;
+    }
+
+    let config = payload.config.trim();
+    if let Err(err) = db::validate_config(config) {
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+    }
+    match state.db.set_config(id, config).await {
+        Ok(0) => (StatusCode::NOT_FOUND, "token not found").into_response(),
+        Ok(_) => (StatusCode::OK, "ok").into_response(),
         Err(err) => internal(err),
     }
 }
@@ -193,17 +233,12 @@ async fn disable_token(
     update_enabled(state, headers, id, false).await
 }
 
-async fn update_enabled(
-    state: AppState,
-    headers: HeaderMap,
-    id: i32,
-    enabled: bool,
-) -> Response {
+async fn update_enabled(state: AppState, headers: HeaderMap, id: i32, enabled: bool) -> Response {
     if let Err(response) = guard(&state, &headers) {
         return response;
     }
 
-    match state.db.set_enabled_by_id(id, enabled).await {
+    match state.db.set_enabled(id, enabled).await {
         Ok(0) => (StatusCode::NOT_FOUND, "token not found").into_response(),
         Ok(_) => (StatusCode::OK, "ok").into_response(),
         Err(err) => internal(err),
@@ -219,7 +254,7 @@ async fn remove_token(
         return response;
     }
 
-    match state.db.remove_by_id(id).await {
+    match state.db.remove(id).await {
         Ok(0) => (StatusCode::NOT_FOUND, "token not found").into_response(),
         Ok(_) => (StatusCode::OK, "ok").into_response(),
         Err(err) => internal(err),
@@ -251,14 +286,12 @@ fn session_valid(admin: &AdminState, headers: &HeaderMap) -> bool {
 
 fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookie
-        .split(';')
-        .find_map(|part| {
-            let part = part.trim();
-            part.strip_prefix(SESSION_COOKIE)
-                .and_then(|rest| rest.strip_prefix('='))
-                .map(str::to_owned)
-        })
+    cookie.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix(SESSION_COOKIE)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::to_owned)
+    })
 }
 
 fn set_cookie(response: &mut Response, cookie: &str) {
@@ -271,10 +304,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter()
-        .zip(b)
-        .fold(0u8, |diff, (x, y)| diff | (x ^ y))
-        == 0
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 fn internal(err: anyhow::Error) -> Response {

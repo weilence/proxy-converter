@@ -8,6 +8,7 @@ pub struct Model {
     #[sea_orm(unique)]
     pub token: String,
     pub name: String,
+    pub config: String,
     pub enabled: bool,
     pub expires_at: Option<DateTime>,
     pub created_at: DateTime,

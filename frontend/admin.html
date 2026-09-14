@@ -49,13 +49,34 @@ button.danger:hover { background: #fef1f0; }
 .topbar h1 { margin: 0; font-size: 20px; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 20px; }
 .add-form { display: grid; grid-template-columns: 2fr 2fr 1fr auto; gap: 12px; align-items: end; }
+.add-form .full { grid-column: 1 / -1; }
 @media (max-width: 720px) { .add-form { grid-template-columns: 1fr; } }
+
+textarea {
+  width: 100%; padding: 9px 12px; font-size: 13px; color: var(--text); resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  border: 1px solid var(--border); border-radius: 8px; background: #fbfcfe; outline: none;
+}
+textarea:focus { border-color: var(--primary); background: #fff; box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.15); }
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
 tr:last-child td { border-bottom: none; }
 td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+td.config-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+
+.modal-mask {
+  position: fixed; inset: 0; z-index: 10; background: rgba(28, 36, 48, 0.45);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.modal-card {
+  width: 100%; max-width: 640px; max-height: 90vh; overflow: auto; background: var(--card);
+  border: 1px solid var(--border); border-radius: 14px; padding: 20px;
+  box-shadow: 0 8px 30px rgba(28, 36, 48, 0.15);
+}
+.modal-card h3 { margin: 0 0 4px; font-size: 16px; }
+.modal-card .sub { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
 .empty { text-align: center; color: var(--muted); padding: 28px 0; }
 
 .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; }
@@ -110,19 +131,35 @@ td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       <input id="new-days" type="number" min="0" placeholder="留空=永久" />
     </div>
     <button type="submit">添加令牌</button>
+    <div class="full">
+      <label for="new-config">配置内容</label>
+      <textarea id="new-config" rows="5" spellcheck="false" placeholder="粘贴 YAML 配置全文；留空则用户获取配置时返回空内容"></textarea>
+    </div>
   </form>
 
   <div class="card">
     <table>
       <thead>
         <tr>
-          <th>ID</th><th>令牌</th><th>备注</th><th>状态</th>
+          <th>ID</th><th>令牌</th><th>备注</th><th>配置内容</th><th>状态</th>
           <th>过期时间</th><th>最近使用</th><th>创建时间</th><th>操作</th>
         </tr>
       </thead>
       <tbody id="token-body"></tbody>
     </table>
     <div id="empty-hint" class="empty hidden">还没有令牌，先添加一个吧。</div>
+  </div>
+</div>
+
+<div id="config-modal" class="modal-mask hidden">
+  <div class="modal-card">
+    <h3>编辑配置内容</h3>
+    <p class="sub">YAML 全文；留空表示不绑定，用户获取配置时将返回空内容。</p>
+    <textarea id="config-editor" rows="14" spellcheck="false"></textarea>
+    <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+      <button type="button" class="secondary" id="config-cancel">取消</button>
+      <button type="button" id="config-save">保存</button>
+    </div>
   </div>
 </div>
 
@@ -191,6 +228,14 @@ $('#logout-btn').addEventListener('click', async () => {
 
 const STATUS_LABEL = { valid: '有效', expired: '已过期', disabled: '已停用' };
 
+let tokensCache = [];
+
+function configPreview(config) {
+  const flat = String(config ?? '').split(/\s+/).filter(Boolean).join(' ');
+  if (!flat) return '-';
+  return flat.length > 32 ? flat.slice(0, 32) + '…' : flat;
+}
+
 async function loadTokens() {
   let tokens;
   try {
@@ -200,17 +245,20 @@ async function loadTokens() {
     return;
   }
 
+  tokensCache = tokens;
   $('#token-body').innerHTML = tokens.map((t) => `
     <tr>
       <td>${t.id}</td>
       <td class="mono">${esc(t.token)}</td>
       <td>${esc(t.name) || '-'}</td>
+      <td class="mono config-cell" title="${esc(t.config)}">${esc(configPreview(t.config))}</td>
       <td><span class="badge ${esc(t.status)}">${STATUS_LABEL[t.status] || esc(t.status)}</span></td>
       <td>${esc(t.expires_at)}</td>
       <td>${esc(t.last_used_at)}</td>
       <td>${esc(t.created_at)}</td>
       <td>
         <div class="actions">
+          <button class="secondary" onclick="editConfig(${t.id})">配置</button>
           ${t.status === 'disabled'
             ? `<button class="secondary" onclick="enableToken(${t.id})">启用</button>`
             : `<button class="secondary" onclick="disableToken(${t.id})">停用</button>`}
@@ -227,10 +275,16 @@ $('#add-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const token = $('#new-token').value.trim();
   const name = $('#new-name').value.trim();
+  const config = $('#new-config').value.trim();
   const daysRaw = $('#new-days').value.trim();
   if (!token) return;
 
-  const body = JSON.stringify({ token, name, days: daysRaw === '' ? null : Number(daysRaw) });
+  const body = JSON.stringify({
+    token,
+    name,
+    config,
+    days: daysRaw === '' ? null : Number(daysRaw),
+  });
   let res;
   try {
     res = await api('/admin/api/tokens', { method: 'POST', body });
@@ -240,13 +294,55 @@ $('#add-form').addEventListener('submit', async (event) => {
     toast('令牌已添加');
     $('#new-token').value = '';
     $('#new-name').value = '';
+    $('#new-config').value = '';
     $('#new-days').value = '';
     loadTokens();
   } else if (res.status === 409) {
     toast('令牌已存在', true);
   } else {
-    toast(`添加失败 (${res.status})`, true);
+    const msg = (await res.text()).slice(0, 120);
+    toast(msg || `添加失败 (${res.status})`, true);
   }
+});
+
+let editingTokenId = null;
+
+function editConfig(id) {
+  const token = tokensCache.find((t) => t.id === id);
+  if (!token) return;
+  editingTokenId = id;
+  $('#config-editor').value = token.config || '';
+  $('#config-modal').classList.remove('hidden');
+  $('#config-editor').focus();
+}
+
+function closeConfigModal() {
+  $('#config-modal').classList.add('hidden');
+  editingTokenId = null;
+}
+
+$('#config-cancel').addEventListener('click', closeConfigModal);
+$('#config-modal').addEventListener('click', (event) => {
+  if (event.target === $('#config-modal')) closeConfigModal();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('#config-modal').classList.contains('hidden')) closeConfigModal();
+});
+
+$('#config-save').addEventListener('click', async () => {
+  if (editingTokenId === null) return;
+  try {
+    const res = await api(`/admin/api/tokens/${editingTokenId}/config`, {
+      method: 'POST',
+      body: JSON.stringify({ config: $('#config-editor').value.trim() }),
+    });
+    if (res.ok) { toast('配置内容已更新'); closeConfigModal(); loadTokens(); }
+    else if (res.status === 404) toast('令牌不存在', true);
+    else {
+      const msg = (await res.text()).slice(0, 120);
+      toast(msg || `保存失败 (${res.status})`, true);
+    }
+  } catch (err) { toast(err.message, true); }
 });
 
 async function toggleEnabled(id, enabled) {

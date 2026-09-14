@@ -1,36 +1,27 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use axum::{
-    extract::{Query, State},
-    http::{header, HeaderValue, StatusCode},
+    Router,
+    extract::{Query, RawQuery, State},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use serde::Deserialize;
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
 
-use crate::{admin::AdminState, db::Db, js::JsTransformer};
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::{admin::AdminState, db::Db};
 
 pub(crate) type AppState = Arc<AppStateInner>;
 
 pub(crate) struct AppStateInner {
-    pub(crate) http: reqwest::Client,
     pub(crate) db: Db,
     pub(crate) admin: AdminState,
-    pub(crate) transformer: Option<JsTransformer>,
 }
 
-pub async fn run(addr: SocketAddr, script: Option<PathBuf>, database: PathBuf) -> Result<()> {
-    let transformer = match &script {
-        Some(path) => Some(JsTransformer::start(path)?),
-        None => None,
-    };
-
+pub async fn run(addr: SocketAddr, database: PathBuf) -> Result<()> {
     let db = Db::open(&database).await?;
 
     let admin = AdminState::from_env();
@@ -38,20 +29,10 @@ pub async fn run(addr: SocketAddr, script: Option<PathBuf>, database: PathBuf) -
         warn!("Admin page is disabled; set ADMIN_PASSWORD to enable it");
     }
 
-    let http = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(concat!("proxy-converter/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("failed to build the HTTP client")?;
-
-    let state: AppState = Arc::new(AppStateInner {
-        http,
-        db,
-        admin,
-        transformer,
-    });
+    let state: AppState = Arc::new(AppStateInner { db, admin });
 
     let app = Router::new()
+        .route("/config", get(config))
         .route("/convert", get(convert))
         .merge(crate::admin::routes())
         .with_state(state);
@@ -71,62 +52,40 @@ pub async fn run(addr: SocketAddr, script: Option<PathBuf>, database: PathBuf) -
 }
 
 #[derive(Deserialize)]
-struct ConvertParams {
-    url: String,
+struct ConfigParams {
     token: Option<String>,
 }
 
-async fn convert(
+/// Serve the proxy config bound to the token.
+async fn config(
     State(state): State<AppState>,
-    Query(params): Query<ConvertParams>,
+    Query(params): Query<ConfigParams>,
 ) -> Result<Response, AppError> {
     let provided = params.token.as_deref().unwrap_or_default();
-    if !state.db.verify(provided).await {
+    let Some(record) = state.db.verify(provided).await else {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "Unauthorized"));
+    };
+
+    // A token without bound content yields empty content.
+    Ok(config_response(record.config.trim().to_owned()))
+}
+
+/// `/convert` is deprecated; redirect to `/config`, preserving the query.
+async fn convert(RawQuery(query): RawQuery) -> Response {
+    let location = match query.filter(|query| !query.is_empty()) {
+        Some(query) => format!("/config?{query}"),
+        None => "/config".to_owned(),
+    };
+    match HeaderValue::from_str(&location) {
+        Ok(location) => (StatusCode::FOUND, [(header::LOCATION, location)]).into_response(),
+        Err(_) => (StatusCode::FOUND, "moved to /config").into_response(),
     }
+}
 
-    let body = state
-        .http
-        .get(&params.url)
-        .send()
-        .await
-        .and_then(|response| response.error_for_status())
-        .map_err(|err| {
-            AppError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("failed to fetch the upstream config: {err}"),
-            )
-        })?
-        .text()
-        .await
-        .map_err(|err| {
-            AppError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("failed to read the upstream config: {err}"),
-            )
-        })?;
-
-    let mut data: serde_json::Value = serde_yaml::from_str(&body)
-        .map_err(|err| {
-            AppError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("failed to parse the upstream YAML: {err}"),
-            )
-        })?;
-
-    if let Some(transformer) = &state.transformer {
-        data = transformer
-            .transform(data)
-            .await
-            .map_err(AppError::internal)?;
-    }
-
-    let yaml = serde_yaml::to_string(&data)
-        .map_err(|err| AppError::internal(format!("failed to serialize the YAML: {err}")))?;
-    // serde_yaml emits a document start marker; drop it to match the old output.
-    let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml).to_owned();
-
-    let mut response = Response::new(axum::body::Body::from(yaml));
+/// Build the downloadable `config.yaml` response; an empty body means the
+/// token has no config bound.
+fn config_response(body: String) -> Response {
+    let mut response = Response::new(axum::body::Body::from(body));
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_DISPOSITION,
@@ -136,7 +95,7 @@ async fn convert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-yaml"),
     );
-    Ok(response)
+    response
 }
 
 struct AppError {
@@ -150,10 +109,6 @@ impl AppError {
             status,
             message: message.into(),
         }
-    }
-
-    fn internal(message: impl std::fmt::Display) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message.to_string())
     }
 }
 
