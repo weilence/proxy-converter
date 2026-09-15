@@ -29,10 +29,17 @@ proxy-converter run --addr 0.0.0.0:8080 --database tokens.db
 
 ## 管理后台
 
-设置环境变量 `ADMIN_PASSWORD` 后，服务在 `/admin` 提供网页版令牌管理后台（页面源码位于 `frontend/` 目录，编译时内嵌进二进制）：
+设置环境变量 `ADMIN_PASSWORD` 后，服务在 `/admin` 提供网页版令牌管理后台（页面源码位于 `frontend/` 目录，Vue 3 + Nuxt UI 构建，release 编译时内嵌进二进制；debug 构建不提供页面、仅提供 API，见下文[前端开发](#前端开发)）：
 
 ```sh
 ADMIN_PASSWORD=your-password proxy-converter run
+```
+
+环境变量也可以写进 `.env` 文件（从工作目录向上查找，真实环境变量优先；模板见
+[.env.example](.env.example)，文件已被 gitignore）：
+
+```sh
+cp .env.example .env   # 然后填入 ADMIN_PASSWORD
 ```
 
 - 浏览器打开 `http://127.0.0.1:8080/admin`，输入管理员密码登录
@@ -52,13 +59,38 @@ GET /config?token=<令牌>
 > `GET /convert` 已废弃：现在返回 302 重定向到 `/config`（自动携带原有查询参数），
 > 请尽早迁移到新接口。
 
+## 前端开发
+
+管理后台前端位于 `frontend/`（Vue 3 + TypeScript + Nuxt UI，Vite 构建）。后端 debug
+开发不需要 Node；前端开发需要 Node.js ≥ 20，配合 Vite dev server 进行：
+
+```sh
+# 终端 1：后端 API（debug 构建仅提供接口；密码可写入 .env）
+cargo run
+
+# 终端 2：Vite 开发服务器（/admin/api、/config 代理到 127.0.0.1:8080）
+cd frontend
+npm install
+npm run dev
+```
+
+浏览器打开 <http://localhost:5173/admin/>，前端改动热更新，无需重编 Rust。
+
+`npm run build` 产出 `frontend/dist/`（同跑 `vue-tsc` 类型检查）；release 编译时由
+[rust-embed](https://crates.io/crates/rust-embed) 将其嵌入二进制，因此 **release 编译前必须先
+完成前端构建**（[scripts/release.sh](scripts/release.sh) 已按此顺序执行）。
+
 ## 部署（systemd）
 
 仓库根目录提供 [proxy-converter.service](proxy-converter.service) 模板：
 
 ```sh
-cargo build --release
+./scripts/release.sh
 sudo install -m 755 target/release/proxy-converter /usr/local/bin/
+```
+
+脚本等价于先 `cd frontend && npm ci && npm run build`（前端产物内嵌进二进制），再
+`cargo build --release`。
 
 # 创建无登录权限的专用运行用户
 sudo useradd --system --user-group --home-dir /nonexistent --shell /usr/sbin/nologin proxy-converter
@@ -98,9 +130,10 @@ CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc"
 AR_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-ar"
 ```
 
-构建：
+构建（release 二进制内嵌前端产物，需先构建前端）：
 
 ```sh
+(cd frontend && npm ci && npm run build)
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 

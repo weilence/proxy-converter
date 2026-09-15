@@ -10,6 +10,9 @@ anyhow = "1"
 axum = "0.8"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+mime_guess = "2"
+rust-embed = "8"
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-chrono"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

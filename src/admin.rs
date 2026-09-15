@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -44,26 +44,57 @@ impl AdminState {
 }
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/admin", get(page))
+    // The admin UI is embedded only in release builds; debug builds expose
+    // the API alone so the frontend is served by the Vite dev server.
+    let router = Router::new()
         .route("/admin/api/login", post(login))
         .route("/admin/api/logout", post(logout))
         .route("/admin/api/tokens", get(list_tokens).post(add_token))
         .route("/admin/api/tokens/{id}/enable", post(enable_token))
         .route("/admin/api/tokens/{id}/disable", post(disable_token))
         .route("/admin/api/tokens/{id}/config", post(set_token_config))
-        .route("/admin/api/tokens/{id}", delete(remove_token))
+        .route("/admin/api/tokens/{id}", delete(remove_token));
+
+    #[cfg(not(debug_assertions))]
+    let router = router
+        .route("/admin", get(release_page))
+        .route("/admin/", get(release_page))
+        .route("/admin/assets/{*path}", get(crate::assets::asset));
+
+    #[cfg(debug_assertions)]
+    let router = router
+        .route("/admin", get(debug_page))
+        .route("/admin/", get(debug_page));
+
+    router
 }
 
-async fn page(State(state): State<AppState>) -> Response {
+#[cfg(not(debug_assertions))]
+async fn release_page(State(state): State<AppState>) -> Response {
     if !state.admin.enabled() {
-        return (
-            StatusCode::NOT_FOUND,
-            "admin page is disabled; set ADMIN_PASSWORD to enable",
-        )
-            .into_response();
+        return disabled_page().into_response();
     }
-    Html(include_str!("../frontend/admin.html")).into_response()
+    crate::assets::page().await
+}
+
+#[cfg(debug_assertions)]
+async fn debug_page(State(state): State<AppState>) -> Response {
+    if !state.admin.enabled() {
+        return disabled_page().into_response();
+    }
+    (
+        StatusCode::OK,
+        "admin UI is not served in debug builds; run `npm run dev` in frontend/, \
+         or use a release build",
+    )
+        .into_response()
+}
+
+fn disabled_page() -> (StatusCode, &'static str) {
+    (
+        StatusCode::NOT_FOUND,
+        "admin page is disabled; set ADMIN_PASSWORD to enable",
+    )
 }
 
 #[derive(Deserialize)]

@@ -1,0 +1,6 @@
+# Frontend (frontend/)
+node_modules/
+dist/
+auto-imports.d.ts
+components.d.ts
+.nuxt/

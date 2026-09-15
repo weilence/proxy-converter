@@ -1,4 +1,6 @@
 mod admin;
+#[cfg(not(debug_assertions))]
+mod assets;
 mod db;
 mod entity;
 mod server;
@@ -37,6 +39,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_dotenv();
+
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
@@ -48,4 +52,19 @@ async fn main() -> Result<()> {
 
     let Command::Run { addr } = cli.command;
     server::run(addr, cli.database).await
+}
+
+/// Load `.env` from the working directory (or any parent) before anything
+/// reads the environment. Existing variables keep precedence over file values.
+fn load_dotenv() {
+    if let Err(err) = dotenvy::dotenv() {
+        // A missing file is the normal case; anything else is worth reporting,
+        // since a broken file would silently drop all of its variables.
+        if !matches!(
+            err,
+            dotenvy::Error::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound
+        ) {
+            eprintln!("warning: failed to load .env: {err}");
+        }
+    }
 }
