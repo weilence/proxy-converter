@@ -4,8 +4,7 @@
 FROM node:22-alpine AS frontend
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci
+RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
@@ -14,12 +13,19 @@ FROM rust:1-alpine AS build
 # zstd and bundled SQLite compile C code, so a toolchain is required
 RUN apk add --no-cache build-base
 WORKDIR /app
+# Compile the dependency tree against a stub main so this layer is keyed on
+# Cargo.toml/Cargo.lock only and the CI layer cache survives src changes.
+# The stub's own artifacts are removed so the real build cannot mistake
+# them for fresh outputs and ship an empty binary.
 COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
+    cargo build --release --locked && \
+    rm -rf target/release/deps/proxy_converter* \
+           target/release/.fingerprint/proxy-converter-* \
+           target/release/proxy-converter
 COPY src ./src
 COPY --from=frontend /app/dist ./frontend/dist
-RUN --mount=type=cache,target=/app/target \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --locked && \
+RUN cargo build --release --locked && \
     cp target/release/proxy-converter /usr/local/bin/proxy-converter
 
 # ---- Stage 3: minimal runtime ----

@@ -6,6 +6,8 @@
 
 [Dockerfile](../Dockerfile) 分三个阶段：Node 构建前端产物 → Rust 编译 release 二进制（前端产物经 rust-embed 内嵌）→ alpine 运行镜像（约 10 MB，含 ca-certificates 与 tzdata）。
 
+Rust 阶段先用空 `main.rs` 只依据 `Cargo.toml`/`Cargo.lock` 预编译全部依赖，再拷入源码编译。这样依赖层配合 CI 的 `type=gha` 层缓存，改代码的提交只重编根 crate；只有依赖（lockfile）变化才触发全量重编。Dockerfile 中刻意不用 `RUN --mount=type=cache`：其内容不进镜像层、也不会导出到 gha 缓存，在临时 CI runner 上纯属空转。
+
 要点：
 
 - 容器内监听 `0.0.0.0:8080`（默认的 127.0.0.1 在端口映射下不可达）
