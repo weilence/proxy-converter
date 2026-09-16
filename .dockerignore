@@ -1,0 +1,25 @@
+# VCS and CI
+.git
+.github
+
+# Rust build outputs and test data (not needed: release build compiles no tests)
+target
+tests
+
+# Frontend: keep the image build self-contained — dist is rebuilt inside the
+# container, node_modules is always reinstalled from the lockfile
+frontend/node_modules
+frontend/dist
+frontend/.nuxt
+
+# Local databases and secrets must never enter a build
+*.db
+*.db-shm
+*.db-wal
+.env
+
+# Docs and machine-local files are irrelevant to the image
+*.md
+docs
+LICENSE
+compose.yml

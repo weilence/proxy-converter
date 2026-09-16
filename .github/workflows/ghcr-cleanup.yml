@@ -1,0 +1,30 @@
+# 每天定时清理 ghcr.io 上的旧镜像版本:每次推送新 latest 后,旧版本会
+# 变成 untagged,这里统一删除,仓库里始终只剩 latest 一个可用版本。
+# 多架构 manifest 引用的子镜像会被 action 自动保护,不会误删。
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 里配置
+# PACKAGE_CLEANUP_PAT:classic PAT,勾选 read:packages 和 delete:packages。
+name: ghcr-cleanup
+
+on:
+  schedule:
+    - cron: "30 18 * * *" # 每天一次;GitHub 定时任务用 UTC,18:30 = 北京时间 02:30
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete untagged versions older than 1 day
+        uses: snok/container-retention-policy@v3
+        with:
+          # literal "user" = personal account packages
+          account: user
+          image-names: proxy-converter
+          tag-selection: untagged
+          # 只清理超过 1 天的版本,避免和正在进行的构建竞态
+          cut-off: 1d
+          token: ${{ secrets.PACKAGE_CLEANUP_PAT }}

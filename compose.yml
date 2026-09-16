@@ -1,0 +1,17 @@
+# 服务器部署模板:数据库落在宿主机 ./data 目录,升级容器数据不丢。
+# 用法:
+#   docker login ghcr.io          # 首次:用户名 weilence,密码为 read:packages PAT
+#   docker compose up -d          # 启动
+#   docker compose pull && docker compose up -d   # 升级到最新 latest
+services:
+  proxy-converter:
+    image: ghcr.io/weilence/proxy-converter:latest
+    container_name: proxy-converter
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # 不设置(或留空)则管理后台禁用,仅 /config 可用
+      - ADMIN_PASSWORD=your-password
+    volumes:
+      - ./data:/data # SQLite 数据库(tokens.db)落在这里
