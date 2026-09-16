@@ -34,7 +34,9 @@ pub async fn run(addr: SocketAddr, database: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/config", get(config))
         .route("/convert", get(convert))
-        .route("/mrs/{name}", get(mrs))
+        .route("/files/{name}", get(file))
+        // Legacy alias kept for configs rewritten before the generic endpoint.
+        .route("/mrs/{name}", get(file))
         .merge(crate::admin::routes())
         .with_state(state);
 
@@ -88,9 +90,10 @@ struct MrsParams {
     token: Option<String>,
 }
 
-/// Serve one of the token's converted rule files, e.g. `/mrs/google.mrs`.
-/// The file set is private per token: names never collide across tokens.
-async fn mrs(
+/// Serve one of the token's hosted files, e.g. `/files/google.mrs` or
+/// `/files/geoip`. The file set is private per token: names never collide
+/// across tokens. `/mrs/{name}` is a legacy alias of this handler.
+async fn file(
     State(state): State<AppState>,
     Path(name): Path<String>,
     Query(params): Query<MrsParams>,
@@ -100,15 +103,15 @@ async fn mrs(
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "Unauthorized"));
     };
 
-    let file_name = name.strip_suffix(".mrs").unwrap_or(&name);
+    let lookup_name = name.strip_suffix(".mrs").unwrap_or(&name);
     let file = state
         .db
-        .get_mrs_file(record.id, file_name)
+        .get_hosted_file(record.id, lookup_name)
         .await
         .map_err(|err| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such mrs file"))?;
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such file"))?;
 
-    let disposition = format!("attachment; filename={file_name}.mrs");
+    let disposition = format!("attachment; filename={name}");
     let mut response = Response::new(axum::body::Body::from(file.content));
     let headers = response.headers_mut();
     if let Ok(value) = HeaderValue::from_str(&disposition) {

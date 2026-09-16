@@ -1,9 +1,10 @@
 use sea_orm::entity::prelude::*;
 
-/// A converted `.mrs` rule file hosted on behalf of one token. Names are
-/// unique per token: different tokens never share their files.
+/// A file hosted on behalf of one token: a converted `.mrs` rule set or a
+/// geo database (geox-url). Names are unique per token: different tokens
+/// never share their files.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "mrs_files")]
+#[sea_orm(table_name = "hosted_files")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,

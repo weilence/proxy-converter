@@ -56,6 +56,14 @@ GET /config?token=<令牌>
 令牌通过 `token` 查询参数携带，必须是数据库中有效的令牌，否则返回 401。
 返回管理员为该令牌绑定的配置内容；令牌未绑定配置内容时返回 200 与空内容（空响应体）。
 
+```
+GET /files/{name}?token=<令牌>
+```
+
+下载管理后台为该令牌托管的文件，如 mrs 转换产出的 `/files/google.mrs`、geo 托管的
+`/files/geoip`、`/files/geosite`、`/files/mmdb`、`/files/asn`。`GET /mrs/{name}` 为
+改版前的旧路径，仍然兼容。
+
 > `GET /convert` 已废弃：现在返回 302 重定向到 `/config`（自动携带原有查询参数），
 > 请尽早迁移到新接口。
 

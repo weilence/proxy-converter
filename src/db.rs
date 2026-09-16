@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context as _, Result};
 use chrono::{Local, Utc};
@@ -8,7 +8,7 @@ use sea_orm::{
     TransactionTrait, prelude::DateTime,
 };
 
-use crate::entity::{mrs_file, token};
+use crate::entity::{hosted_file, token};
 
 const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS tokens (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,7 +21,7 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS tokens (
     last_used_at TEXT
 )";
 
-const CREATE_MRS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS mrs_files (
+const CREATE_HOSTED_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS hosted_files (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     token_id   INTEGER NOT NULL,
     name       TEXT NOT NULL,
@@ -123,11 +123,11 @@ impl Db {
             .context("failed to fetch the token")
     }
 
-    /// Delete a token by id along with its hosted mrs files; returns the
-    /// number of removed token rows.
+    /// Delete a token by id along with its hosted files; returns the number
+    /// of removed token rows.
     pub async fn remove(&self, id: i32) -> Result<u64> {
         let txn = self.conn.begin().await?;
-        delete_mrs_files(&txn, id).await?;
+        delete_hosted_files(&txn, id).await?;
         let removed = token::Entity::delete_by_id(id)
             .exec(&txn)
             .await
@@ -189,52 +189,107 @@ impl Db {
             .context("failed to list the tokens")
     }
 
-    /// Replace the mrs files hosted for a token with a fresh conversion run.
-    pub async fn set_mrs_files(&self, token_id: i32, files: Vec<NewMrsFile>) -> Result<()> {
+    /// Sync the hosted files of a token after an mrs conversion run:
+    /// re-converted files are replaced with fresh content, files whose
+    /// provider is still in the config (`keep_names`) but was skipped or
+    /// failed this run are preserved, and files whose provider is gone from
+    /// the config are dropped.
+    pub async fn set_hosted_files(
+        &self,
+        token_id: i32,
+        files: Vec<NewHostedFile>,
+        keep_names: &HashSet<String>,
+    ) -> Result<()> {
         let txn = self.conn.begin().await?;
-        delete_mrs_files(&txn, token_id).await?;
-        for file in files {
-            mrs_file::ActiveModel {
-                token_id: Set(token_id),
-                name: Set(file.name),
-                source_url: Set(file.source_url),
-                content: Set(file.content),
-                updated_at: Set(now()),
-                ..Default::default()
-            }
-            .insert(&txn)
-            .await
-            .context("failed to store the mrs file")?;
+        if keep_names.is_empty() {
+            delete_hosted_files(&txn, token_id).await?;
+        } else {
+            hosted_file::Entity::delete_many()
+                .filter(hosted_file::Column::TokenId.eq(token_id))
+                .filter(
+                    hosted_file::Column::Name
+                        .is_not_in(keep_names.iter().cloned().collect::<Vec<_>>()),
+                )
+                .exec(&txn)
+                .await
+                .map(|_| ())
+                .context("failed to delete the token's stale hosted files")?;
         }
+        upsert_hosted_files(&txn, token_id, files).await?;
         txn.commit().await?;
         Ok(())
     }
 
-    /// Fetch one of a token's mrs files by provider name.
-    pub async fn get_mrs_file(&self, token_id: i32, name: &str) -> Result<Option<mrs_file::Model>> {
-        mrs_file::Entity::find()
-            .filter(mrs_file::Column::TokenId.eq(token_id))
-            .filter(mrs_file::Column::Name.eq(name))
+    /// Add or replace the given hosted files without touching anything else;
+    /// used by the geo conversion, whose file set is fixed.
+    pub async fn upsert_hosted_files(
+        &self,
+        token_id: i32,
+        files: Vec<NewHostedFile>,
+    ) -> Result<()> {
+        let txn = self.conn.begin().await?;
+        upsert_hosted_files(&txn, token_id, files).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Fetch one of a token's hosted files by name.
+    pub async fn get_hosted_file(
+        &self,
+        token_id: i32,
+        name: &str,
+    ) -> Result<Option<hosted_file::Model>> {
+        hosted_file::Entity::find()
+            .filter(hosted_file::Column::TokenId.eq(token_id))
+            .filter(hosted_file::Column::Name.eq(name))
             .one(&self.conn)
             .await
-            .context("failed to fetch the mrs file")
+            .context("failed to fetch the hosted file")
     }
 }
 
-/// A new mrs file to host for a token.
-pub struct NewMrsFile {
+/// A new hosted file for a token.
+pub struct NewHostedFile {
     pub name: String,
     pub source_url: String,
     pub content: Vec<u8>,
 }
 
-async fn delete_mrs_files(txn: &DatabaseTransaction, token_id: i32) -> Result<()> {
-    mrs_file::Entity::delete_many()
-        .filter(mrs_file::Column::TokenId.eq(token_id))
+async fn upsert_hosted_files(
+    txn: &DatabaseTransaction,
+    token_id: i32,
+    files: Vec<NewHostedFile>,
+) -> Result<()> {
+    for file in files {
+        hosted_file::Entity::delete_many()
+            .filter(hosted_file::Column::TokenId.eq(token_id))
+            .filter(hosted_file::Column::Name.eq(&file.name))
+            .exec(txn)
+            .await
+            .map(|_| ())
+            .context("failed to replace the hosted file")?;
+        hosted_file::ActiveModel {
+            token_id: Set(token_id),
+            name: Set(file.name),
+            source_url: Set(file.source_url),
+            content: Set(file.content),
+            updated_at: Set(now()),
+            ..Default::default()
+        }
+        .insert(txn)
+        .await
+        .context("failed to store the hosted file")?;
+    }
+    Ok(())
+}
+
+async fn delete_hosted_files(txn: &DatabaseTransaction, token_id: i32) -> Result<()> {
+    hosted_file::Entity::delete_many()
+        .filter(hosted_file::Column::TokenId.eq(token_id))
         .exec(txn)
         .await
         .map(|_| ())
-        .context("failed to delete the token's mrs files")
+        .context("failed to delete the token's hosted files")
 }
 
 /// Current UTC time; stored as `YYYY-MM-DD HH:MM:SS`.
@@ -299,7 +354,7 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
         conn.execute_unprepared(CREATE_TABLE_SQL)
             .await
             .context("failed to create the `tokens` table")?;
-        return create_mrs_table(conn).await;
+        return create_hosted_table(conn).await;
     }
 
     let has_id = conn
@@ -313,7 +368,7 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
     if has_id {
         // v0.2: tokens gained a bound config served by `/convert`.
         add_config_column_if_missing(conn).await?;
-        return create_mrs_table(conn).await;
+        return create_hosted_table(conn).await;
     }
 
     tracing::info!("Migrating the `tokens` table to the new schema");
@@ -334,14 +389,43 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
             .context("failed to migrate the `tokens` table")?;
     }
 
-    create_mrs_table(conn).await
+    create_hosted_table(conn).await
 }
 
-/// Create the `mrs_files` table on databases that predate it.
-async fn create_mrs_table(conn: &DatabaseConnection) -> Result<()> {
-    conn.execute_unprepared(CREATE_MRS_TABLE_SQL)
+/// Create the `hosted_files` table; databases from before the rename carry
+/// the same table as `mrs_files`, which is renamed in place.
+async fn create_hosted_table(conn: &DatabaseConnection) -> Result<()> {
+    let table_exists = |name: &str| {
+        Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{name}'"),
+        )
+    };
+    let hosted_exists = conn
+        .query_one(table_exists("hosted_files"))
         .await
-        .context("failed to create the `mrs_files` table")?;
+        .context("failed to inspect the database")?
+        .is_some();
+    if hosted_exists {
+        return Ok(());
+    }
+
+    let mrs_exists = conn
+        .query_one(table_exists("mrs_files"))
+        .await
+        .context("failed to inspect the database")?
+        .is_some();
+    if mrs_exists {
+        tracing::info!("Renaming `mrs_files` to `hosted_files`");
+        conn.execute_unprepared("ALTER TABLE mrs_files RENAME TO hosted_files")
+            .await
+            .context("failed to rename the `mrs_files` table")?;
+        return Ok(());
+    }
+
+    conn.execute_unprepared(CREATE_HOSTED_TABLE_SQL)
+        .await
+        .context("failed to create the `hosted_files` table")?;
     Ok(())
 }
 

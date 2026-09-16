@@ -1,4 +1,4 @@
-pub mod mrs_file;
+pub mod hosted_file;
 pub mod token;
 
 /// Friendlier alias for the generated `token::Model`.

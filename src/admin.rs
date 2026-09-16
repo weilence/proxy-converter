@@ -15,13 +15,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
 
-use crate::{db, db::NewMrsFile, entity::Token, mrs, server::AppState};
+use crate::{db, db::NewHostedFile, entity::Token, geo, mrs, server::AppState};
 
 const SESSION_COOKIE: &str = "admin_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 /// Download timeout for mrs source fetching.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Download timeout for geo database fetching; they are far larger.
+const GEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Admin authentication state. The admin page is disabled unless the
 /// `ADMIN_PASSWORD` environment variable is set to a non-empty value.
@@ -60,6 +63,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/api/tokens/{id}/convert-mrs",
             post(convert_token_mrs),
+        )
+        .route(
+            "/admin/api/tokens/{id}/convert-geo",
+            post(convert_token_geo),
         )
         .route("/admin/api/tokens/{id}", delete(remove_token));
 
@@ -358,6 +365,10 @@ async fn convert_token_mrs(
     let mut results = Vec::with_capacity(providers.len());
     let mut converted = HashSet::new();
     let mut files = Vec::new();
+    // Hosted geo files must survive mrs sync: the two conversions share one
+    // file store per token.
+    let mut keep = geo::geo_names();
+    keep.extend(providers.iter().map(|p| p.name.clone()));
     for provider in providers {
         let outcome = mrs::convert_provider(&client, &record.token, &base_url, &provider).await;
         let (status, size, url, reason, error) = match &outcome {
@@ -371,8 +382,21 @@ async fn convert_token_mrs(
                 ("failed", None, None, None, Some(error.to_string()))
             }
         };
+        // A provider that was not re-converted keeps its previously hosted
+        // file, so its download link stays valid; surface that link.
+        let (status, size, url) = if matches!(outcome, mrs::ProviderOutcome::Converted { .. }) {
+            (status, size, url)
+        } else if let Ok(Some(existing)) = state.db.get_hosted_file(id, &provider.name).await {
+            (
+                status,
+                Some(existing.content.len()),
+                Some(mrs::download_url(&base_url, &record.token, &provider.name)),
+            )
+        } else {
+            (status, size, url)
+        };
         if let mrs::ProviderOutcome::Converted { content, .. } = outcome {
-            files.push(NewMrsFile {
+            files.push(NewHostedFile {
                 name: provider.name.clone(),
                 source_url: provider.url.clone(),
                 content,
@@ -390,7 +414,7 @@ async fn convert_token_mrs(
         });
     }
 
-    if let Err(err) = state.db.set_mrs_files(id, files).await {
+    if let Err(err) = state.db.set_hosted_files(id, files, &keep).await {
         return internal(err);
     }
     let config = match mrs::rewrite_config(&record.config, &base_url, &record.token, &converted) {
@@ -399,6 +423,114 @@ async fn convert_token_mrs(
     };
 
     Json(MrsConvertResponse { results, config }).into_response()
+}
+
+#[derive(Deserialize)]
+struct ConvertGeoPayload {
+    base_url: String,
+}
+
+#[derive(Serialize)]
+struct GeoFileResult {
+    name: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GeoConvertResponse {
+    results: Vec<GeoFileResult>,
+    config: String,
+}
+
+/// Download the token's geo databases (geox-url, falling back to mihomo's
+/// built-in sources) and host them as-is. The token's own config is left
+/// untouched; the rewritten config is returned for review.
+async fn convert_token_geo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+    Json(payload): Json<ConvertGeoPayload>,
+) -> Response {
+    if let Err(response) = guard(&state, &headers) {
+        return response;
+    }
+
+    let base_url = match normalize_base_url(&payload.base_url) {
+        Ok(base_url) => base_url,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+
+    let Some(record) = (match state.db.get(id).await {
+        Ok(record) => record,
+        Err(err) => return internal(err),
+    }) else {
+        return (StatusCode::NOT_FOUND, "token not found").into_response();
+    };
+    if record.config.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "the token has no config").into_response();
+    }
+    let sources = match geo::resolve_sources(&record.config) {
+        Ok(sources) => sources,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    // Geo databases are much larger than rule lists, so allow more time.
+    let client = match reqwest::Client::builder()
+        .timeout(GEO_DOWNLOAD_TIMEOUT)
+        .user_agent(concat!("proxy-converter/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return internal(anyhow::anyhow!("failed to build the HTTP client: {err}")),
+    };
+
+    let mut results = Vec::with_capacity(sources.len());
+    let mut converted = HashSet::new();
+    let mut files = Vec::new();
+    for (name, source_url) in &sources {
+        let outcome = mrs::download(&client, source_url, geo::MAX_GEO_SOURCE_BYTES).await;
+        let (status, mut size, error) = match &outcome {
+            Ok(content) => ("converted", Some(content.len()), None),
+            Err(error) => ("failed", None, Some(error.to_string())),
+        };
+        if let Ok(content) = outcome {
+            files.push(NewHostedFile {
+                name: (*name).to_owned(),
+                source_url: source_url.clone(),
+                content,
+            });
+            converted.insert((*name).to_owned());
+        } else if let Ok(Some(existing)) = state.db.get_hosted_file(id, name).await {
+            // The stale file is still hosted and still served; surface it.
+            size = Some(existing.content.len());
+        }
+        results.push(GeoFileResult {
+            name: (*name).to_owned(),
+            status,
+            size,
+            url: (status == "converted" || size.is_some())
+                .then(|| geo::download_url(&base_url, &record.token, name)),
+            error,
+        });
+    }
+
+    // Failed keys keep their previously hosted file (upsert only touches
+    // what converted), so only the config rewrite depends on this run.
+    if let Err(err) = state.db.upsert_hosted_files(id, files).await {
+        return internal(err);
+    }
+    let config = match geo::rewrite_config(&record.config, &base_url, &record.token, &converted) {
+        Ok(config) => config,
+        Err(err) => return internal(err),
+    };
+
+    Json(GeoConvertResponse { results, config }).into_response()
 }
 
 fn normalize_base_url(raw: &str) -> Result<String, &'static str> {

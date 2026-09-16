@@ -1,4 +1,4 @@
-import type { MrsConvertResult, TokenInfo } from './types'
+import type { GeoConvertResult, MrsConvertResult, TokenInfo } from './types'
 
 export class ApiError extends Error {
   constructor(
@@ -91,6 +91,15 @@ export const api = {
 
   async convertMrs(id: number, baseUrl: string): Promise<MrsConvertResult> {
     const res = await request(`/admin/api/tokens/${id}/convert-mrs`, {
+      method: 'POST',
+      body: JSON.stringify({ base_url: baseUrl }),
+    })
+    if (!res.ok) throw new ApiError(res.status, await errorText(res, '转换失败'))
+    return res.json()
+  },
+
+  async convertGeo(id: number, baseUrl: string): Promise<GeoConvertResult> {
+    const res = await request(`/admin/api/tokens/${id}/convert-geo`, {
       method: 'POST',
       body: JSON.stringify({ base_url: baseUrl }),
     })

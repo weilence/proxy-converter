@@ -29,3 +29,19 @@ export interface MrsConvertResult {
   results: MrsProviderResult[]
   config: string
 }
+
+export type GeoStatus = 'converted' | 'failed'
+
+// Mirrors `GeoFileResult` / `GeoConvertResponse` in src/admin.rs.
+export interface GeoFileResult {
+  name: string
+  status: GeoStatus
+  size?: number
+  url?: string
+  error?: string
+}
+
+export interface GeoConvertResult {
+  results: GeoFileResult[]
+  config: string
+}

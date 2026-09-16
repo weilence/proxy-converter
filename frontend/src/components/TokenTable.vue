@@ -51,6 +51,7 @@ const deleteOpen = computed({
 })
 
 const converting = ref<TokenInfo | null>(null)
+const geoConverting = ref<TokenInfo | null>(null)
 
 async function remove() {
   const row = deleting.value
@@ -109,6 +110,9 @@ const columns: TableColumn<TokenInfo>[] = [
           <UButton size="xs" color="neutral" variant="soft" @click="converting = row.original">
             转 mrs
           </UButton>
+          <UButton size="xs" color="neutral" variant="soft" @click="geoConverting = row.original">
+            转 Geo
+          </UButton>
           <UButton size="xs" color="neutral" variant="soft" @click="toggleEnabled(row.original)">
             {{ row.original.status === 'disabled' ? '启用' : '停用' }}
           </UButton>
@@ -136,5 +140,6 @@ const columns: TableColumn<TokenInfo>[] = [
     </UModal>
 
     <MrsDialog v-model:token="converting" @saved="emit('reload')" />
+    <GeoDialog v-model:token="geoConverting" @saved="emit('reload')" />
   </div>
 </template>

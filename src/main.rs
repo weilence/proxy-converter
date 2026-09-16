@@ -3,6 +3,7 @@ mod admin;
 mod assets;
 mod db;
 mod entity;
+mod geo;
 mod mrs;
 mod server;
 

@@ -436,7 +436,7 @@ pub async fn convert_provider(
         };
     }
 
-    let source = match download(client, &provider.url).await {
+    let source = match download(client, &provider.url, MAX_SOURCE_BYTES).await {
         Ok(source) => source,
         Err(error) => return ProviderOutcome::Failed { error },
     };
@@ -450,7 +450,8 @@ pub async fn convert_provider(
     }
 }
 
-async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+/// Download a source file, refusing bodies larger than `max_bytes`.
+pub async fn download(client: &reqwest::Client, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
     let response = client
         .get(url)
         .send()
@@ -461,16 +462,16 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     }
     if response
         .content_length()
-        .is_some_and(|length| length as usize > MAX_SOURCE_BYTES)
+        .is_some_and(|length| length as usize > max_bytes)
     {
-        bail!("the source exceeds the {MAX_SOURCE_BYTES} byte size limit");
+        bail!("the source exceeds the {max_bytes} byte size limit");
     }
     let body = response
         .bytes()
         .await
         .context("failed to read the source body")?;
-    if body.len() > MAX_SOURCE_BYTES {
-        bail!("the source exceeds the {MAX_SOURCE_BYTES} byte size limit");
+    if body.len() > max_bytes {
+        bail!("the source exceeds the {max_bytes} byte size limit");
     }
     Ok(body.to_vec())
 }
@@ -518,7 +519,7 @@ pub fn parse_rule_providers(config: &str) -> Result<Vec<RuleProvider>> {
 /// Public download URL for a token's converted rule file.
 pub fn download_url(base_url: &str, token: &str, name: &str) -> String {
     format!(
-        "{}/mrs/{}.mrs?token={}",
+        "{}/files/{}.mrs?token={}",
         base_url.trim_end_matches('/'),
         utf8_percent_encode(name, URL_SAFE),
         utf8_percent_encode(token, URL_SAFE),
@@ -704,7 +705,7 @@ rule-providers:
 ";
         let converted: HashSet<String> = ["google".to_owned()].into();
         let rewritten = rewrite_config(config, "http://10.0.0.1:8080/", "abc", &converted).unwrap();
-        assert!(rewritten.contains("http://10.0.0.1:8080/mrs/google.mrs?token=abc"));
+        assert!(rewritten.contains("http://10.0.0.1:8080/files/google.mrs?token=abc"));
         assert!(rewritten.contains("format: mrs"));
         assert!(rewritten.contains("path: ./google.yaml"));
         assert!(rewritten.contains("https://example.com/ads.list"));
