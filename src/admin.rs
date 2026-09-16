@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     sync::Mutex,
     time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -14,11 +15,19 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
+use tracing::{debug, info, warn};
 
 use crate::{db, db::NewHostedFile, entity::Token, geo, mrs, server::AppState};
 
 const SESSION_COOKIE: &str = "admin_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// Consecutive failed logins before the login endpoint locks.
+const MAX_FAILURES: u32 = 5;
+/// Duration of the first lockout; doubles on each subsequent lockout.
+const LOCK_BASE: Duration = Duration::from_secs(60);
+/// Ceiling for the doubling lockout duration.
+const LOCK_MAX: Duration = Duration::from_secs(15 * 60);
 
 /// Download timeout for mrs source fetching.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -31,6 +40,7 @@ const GEO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct AdminState {
     password: Option<String>,
     sessions: Mutex<HashMap<String, Instant>>,
+    login_throttle: Mutex<LoginThrottle>,
 }
 
 impl AdminState {
@@ -41,12 +51,72 @@ impl AdminState {
         Self {
             password,
             sessions: Mutex::new(HashMap::new()),
+            login_throttle: Mutex::new(LoginThrottle::new()),
         }
     }
 
     pub fn enabled(&self) -> bool {
         self.password.is_some()
     }
+}
+
+/// Failed-login throttling. After `MAX_FAILURES` consecutive wrong passwords
+/// the login endpoint rejects every attempt (429) until the lockout expires;
+/// each further lockout doubles the duration up to `LOCK_MAX`. The lockout is
+/// global, which is right for a single-admin service: it cannot be sidestepped
+/// by rotating source IPs. State lives in memory and resets on restart.
+struct LoginThrottle {
+    failures: u32,
+    lockouts: u32,
+    locked_until: Option<Instant>,
+}
+
+impl LoginThrottle {
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            lockouts: 0,
+            locked_until: None,
+        }
+    }
+
+    /// Remaining lockout at `now`, if the endpoint is currently locked.
+    fn lock_remaining(&self, now: Instant) -> Option<Duration> {
+        self.locked_until
+            .filter(|until| *until > now)
+            .map(|until| until - now)
+    }
+
+    /// Record a wrong password; returns the lockout duration when this
+    /// failure triggers a new lockout.
+    fn record_failure(&mut self, now: Instant) -> Option<Duration> {
+        self.failures += 1;
+        if self.failures < MAX_FAILURES {
+            return None;
+        }
+        self.failures = 0;
+        self.lockouts += 1;
+        let lock = LOCK_BASE
+            .saturating_mul(1u32 << (self.lockouts - 1).min(5))
+            .min(LOCK_MAX);
+        self.locked_until = Some(now + lock);
+        Some(lock)
+    }
+
+    fn record_success(&mut self) {
+        self.failures = 0;
+        self.lockouts = 0;
+        self.locked_until = None;
+    }
+}
+
+/// Verdict of one login attempt against the throttle.
+enum LoginOutcome {
+    Ok,
+    /// Wrong password; carries the lockout duration when it triggers one.
+    Failed(Option<Duration>),
+    /// Rejected because the endpoint is locked; carries the remaining time.
+    Locked(Duration),
 }
 
 pub fn routes() -> Router<AppState> {
@@ -69,6 +139,10 @@ pub fn routes() -> Router<AppState> {
             post(convert_token_geo),
         )
         .route("/admin/api/tokens/{id}/duplicate", post(duplicate_token))
+        .route(
+            "/admin/api/tokens/{id}/reset-file-key",
+            post(reset_file_key),
+        )
         .route("/admin/api/tokens/{id}", delete(remove_token));
 
     #[cfg(not(debug_assertions))]
@@ -118,16 +192,62 @@ struct LoginPayload {
     password: String,
 }
 
-async fn login(State(state): State<AppState>, Json(payload): Json<LoginPayload>) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<LoginPayload>,
+) -> Response {
     let Some(password) = state.admin.password.as_ref() else {
         return (StatusCode::NOT_FOUND, "admin page is disabled").into_response();
     };
 
-    if !constant_time_eq(payload.password.as_bytes(), password.as_bytes()) {
-        // Slow down brute-force attempts.
-        sleep(Duration::from_millis(500)).await;
-        return (StatusCode::UNAUTHORIZED, "wrong password").into_response();
+    let ip = client_ip(&headers, peer);
+    let now = Instant::now();
+
+    // Scope the throttle check and password comparison in one block: both are
+    // cheap and synchronous, and the block keeps concurrent guesses from
+    // racing the counter while ending the guard borrow before any await.
+    let outcome = {
+        let Ok(mut throttle) = state.admin.login_throttle.lock() else {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        };
+        if let Some(remaining) = throttle.lock_remaining(now) {
+            LoginOutcome::Locked(remaining)
+        } else if constant_time_eq(payload.password.as_bytes(), password.as_bytes()) {
+            throttle.record_success();
+            LoginOutcome::Ok
+        } else {
+            LoginOutcome::Failed(throttle.record_failure(now))
+        }
+    };
+
+    match outcome {
+        LoginOutcome::Locked(remaining) => {
+            // Debug level: an attacker can spam these and must not flood the log.
+            debug!(
+                ip = %ip,
+                remaining_secs = remaining.as_secs(),
+                "login attempt rejected: endpoint locked"
+            );
+            return too_many_requests(remaining);
+        }
+        LoginOutcome::Failed(lock) => {
+            match lock {
+                Some(lock) => warn!(
+                    ip = %ip,
+                    lock_secs = lock.as_secs(),
+                    "admin login locked after repeated failures"
+                ),
+                None => warn!(ip = %ip, "failed admin login attempt"),
+            }
+            // Slow down single-threaded guessing on top of the lockout.
+            sleep(Duration::from_millis(500)).await;
+            return (StatusCode::UNAUTHORIZED, "wrong password").into_response();
+        }
+        LoginOutcome::Ok => {}
     }
+    info!(ip = %ip, "admin login successful");
 
     let session = uuid::Uuid::new_v4().simple().to_string();
     if let Ok(mut sessions) = state.admin.sessions.lock() {
@@ -138,8 +258,9 @@ async fn login(State(state): State<AppState>, Json(payload): Json<LoginPayload>)
     set_cookie(
         &mut response,
         &format!(
-            "{SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-            SESSION_TTL.as_secs()
+            "{SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
+            SESSION_TTL.as_secs(),
+            cookie_secure_attr(&headers)
         ),
     );
     response
@@ -155,7 +276,10 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let mut response = Json(json!({ "ok": true })).into_response();
     set_cookie(
         &mut response,
-        &format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+        &format!(
+            "{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
+            cookie_secure_attr(&headers)
+        ),
     );
     response
 }
@@ -366,7 +490,7 @@ async fn convert_token_mrs(
     let mut keep = geo::geo_names();
     keep.extend(providers.iter().map(|p| p.name.clone()));
     for provider in providers {
-        let outcome = mrs::convert_provider(&client, &record.token, &base_url, &provider).await;
+        let outcome = mrs::convert_provider(&client, &record.file_key, &base_url, &provider).await;
         let (status, size, url, reason, error) = match &outcome {
             mrs::ProviderOutcome::Converted { size, url, .. } => {
                 ("converted", Some(*size), Some(url.clone()), None, None)
@@ -386,7 +510,11 @@ async fn convert_token_mrs(
             (
                 status,
                 Some(existing.content.len()),
-                Some(mrs::download_url(&base_url, &record.token, &provider.name)),
+                Some(mrs::download_url(
+                    &base_url,
+                    &record.file_key,
+                    &provider.name,
+                )),
             )
         } else {
             (status, size, url)
@@ -413,7 +541,8 @@ async fn convert_token_mrs(
     if let Err(err) = state.db.set_hosted_files(id, files, &keep).await {
         return internal(err);
     }
-    let config = match mrs::rewrite_config(&record.config, &base_url, &record.token, &converted) {
+    let config = match mrs::rewrite_config(&record.config, &base_url, &record.file_key, &converted)
+    {
         Ok(config) => config,
         Err(err) => return internal(err),
     };
@@ -511,7 +640,7 @@ async fn convert_token_geo(
             status,
             size,
             url: (status == "converted" || size.is_some())
-                .then(|| geo::download_url(&base_url, &record.token, name)),
+                .then(|| geo::download_url(&base_url, &record.file_key, name)),
             error,
         });
     }
@@ -521,7 +650,8 @@ async fn convert_token_geo(
     if let Err(err) = state.db.upsert_hosted_files(id, files).await {
         return internal(err);
     }
-    let config = match geo::rewrite_config(&record.config, &base_url, &record.token, &converted) {
+    let config = match geo::rewrite_config(&record.config, &base_url, &record.file_key, &converted)
+    {
         Ok(config) => config,
         Err(err) => return internal(err),
     };
@@ -596,6 +726,24 @@ async fn duplicate_token(
     }
 }
 
+/// Rotate a token's file key and re-point the config's hosted links at it,
+/// e.g. after a config with embedded URLs has leaked.
+async fn reset_file_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+) -> Response {
+    if let Err(response) = guard(&state, &headers) {
+        return response;
+    }
+
+    match state.db.reset_file_key(id).await {
+        Ok(Some(record)) => Json(TokenJson::from_record(&record)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "token not found").into_response(),
+        Err(err) => internal(err),
+    }
+}
+
 /// Reject disabled admin pages and unauthenticated requests.
 #[allow(clippy::result_large_err)] // a boxed error type would not simplify the callers
 fn guard(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -636,6 +784,42 @@ fn set_cookie(response: &mut Response, cookie: &str) {
     }
 }
 
+/// Best-effort client IP for logging: prefer the left-most X-Forwarded-For
+/// hop (set by reverse proxies) and fall back to the socket peer address.
+fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| peer.ip().to_string(), str::to_owned)
+}
+
+/// `; Secure` when the reverse proxy reports an HTTPS frontend via
+/// `X-Forwarded-Proto`, so the same binary also serves plain HTTP. Trusting
+/// the header here fails safe: it can only add the attribute, never drop it.
+fn cookie_secure_attr(headers: &HeaderMap) -> &'static str {
+    let https = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"));
+    if https { "; Secure" } else { "" }
+}
+
+/// 429 response telling the client when the login lockout lifts.
+fn too_many_requests(retry_after: Duration) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many failed attempts; retry later",
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -649,4 +833,85 @@ fn internal(err: anyhow::Error) -> Response {
         format!("internal error: {err}"),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run one full failure budget; returns the triggered lockout, if any.
+    fn fail_until_lockout(throttle: &mut LoginThrottle, now: Instant) -> Option<Duration> {
+        let mut triggered = None;
+        for _ in 0..MAX_FAILURES {
+            triggered = throttle.record_failure(now);
+        }
+        triggered
+    }
+
+    #[test]
+    fn lockout_triggers_after_max_failures() {
+        let mut throttle = LoginThrottle::new();
+        let now = Instant::now();
+        for i in 1..MAX_FAILURES {
+            assert_eq!(
+                throttle.record_failure(now),
+                None,
+                "failure {i} must not lock"
+            );
+        }
+        assert_eq!(throttle.record_failure(now), Some(LOCK_BASE));
+        assert_eq!(throttle.lock_remaining(now), Some(LOCK_BASE));
+    }
+
+    #[test]
+    fn lockout_expires_and_failure_budget_resets() {
+        let mut throttle = LoginThrottle::new();
+        let now = Instant::now();
+        fail_until_lockout(&mut throttle, now);
+
+        let later = now + LOCK_BASE + Duration::from_secs(1);
+        assert_eq!(throttle.lock_remaining(later), None);
+        // The counter restarted with the lockout: single failures are free.
+        assert_eq!(throttle.record_failure(later), None);
+    }
+
+    #[test]
+    fn lockout_duration_doubles_and_caps() {
+        let mut throttle = LoginThrottle::new();
+        let now = Instant::now();
+
+        assert_eq!(fail_until_lockout(&mut throttle, now), Some(LOCK_BASE));
+        assert_eq!(fail_until_lockout(&mut throttle, now), Some(LOCK_BASE * 2));
+        assert_eq!(fail_until_lockout(&mut throttle, now), Some(LOCK_BASE * 4));
+        assert_eq!(fail_until_lockout(&mut throttle, now), Some(LOCK_BASE * 8));
+        // 16 minutes would exceed the cap.
+        assert_eq!(fail_until_lockout(&mut throttle, now), Some(LOCK_MAX));
+        assert_eq!(fail_until_lockout(&mut throttle, now), Some(LOCK_MAX));
+    }
+
+    #[test]
+    fn secure_attr_follows_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(cookie_secure_attr(&headers), "");
+        headers.insert(
+            "x-forwarded-proto"
+                .parse::<axum::http::header::HeaderName>()
+                .unwrap(),
+            HeaderValue::from_static("HTTPS"),
+        );
+        assert_eq!(cookie_secure_attr(&headers), "; Secure");
+    }
+
+    #[test]
+    fn success_resets_everything() {
+        let mut throttle = LoginThrottle::new();
+        let now = Instant::now();
+        fail_until_lockout(&mut throttle, now);
+        assert!(throttle.lock_remaining(now).is_some());
+
+        throttle.record_success();
+        assert_eq!(throttle.lock_remaining(now), None);
+        // A full failure budget is available again, back to the base lock.
+        assert_eq!(fail_until_lockout(&mut throttle, now), Some(LOCK_BASE));
+    }
 }

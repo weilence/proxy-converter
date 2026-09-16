@@ -42,10 +42,13 @@ pub async fn run(addr: SocketAddr, database: PathBuf) -> Result<()> {
         .with_context(|| format!("failed to bind {addr}"))?;
     info!("Server is running at {addr}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server error")?;
 
     info!("Shutting down...");
     Ok(())
@@ -71,8 +74,8 @@ async fn config(
 }
 
 #[derive(Deserialize)]
-struct MrsParams {
-    token: Option<String>,
+struct FileParams {
+    key: Option<String>,
 }
 
 /// Serve one of the token's hosted files, e.g. `/files/google.mrs` or
@@ -81,10 +84,10 @@ struct MrsParams {
 async fn file(
     State(state): State<AppState>,
     Path(name): Path<String>,
-    Query(params): Query<MrsParams>,
+    Query(params): Query<FileParams>,
 ) -> Result<Response, AppError> {
-    let provided = params.token.as_deref().unwrap_or_default();
-    let Some(record) = state.db.verify(provided).await else {
+    let provided = params.key.as_deref().unwrap_or_default();
+    let Some(record) = state.db.verify_file_key(provided).await else {
         return Err(AppError::new(StatusCode::UNAUTHORIZED, "Unauthorized"));
     };
 

@@ -399,7 +399,7 @@ pub enum ProviderOutcome {
 /// Download a rule-provider source and convert it to a hosted mrs file.
 pub async fn convert_provider(
     client: &reqwest::Client,
-    token: &str,
+    file_key: &str,
     base_url: &str,
     provider: &RuleProvider,
 ) -> ProviderOutcome {
@@ -443,7 +443,7 @@ pub async fn convert_provider(
     match convert(behavior, format, &source) {
         Ok(content) => ProviderOutcome::Converted {
             size: content.len(),
-            url: download_url(base_url, token, &provider.name),
+            url: download_url(base_url, file_key, &provider.name),
             content,
         },
         Err(error) => ProviderOutcome::Failed { error },
@@ -517,12 +517,12 @@ pub fn parse_rule_providers(config: &str) -> Result<Vec<RuleProvider>> {
 }
 
 /// Public download URL for a token's converted rule file.
-pub fn download_url(base_url: &str, token: &str, name: &str) -> String {
+pub fn download_url(base_url: &str, file_key: &str, name: &str) -> String {
     format!(
-        "{}/files/{}.mrs?token={}",
+        "{}/files/{}.mrs?key={}",
         base_url.trim_end_matches('/'),
         utf8_percent_encode(name, URL_SAFE),
-        utf8_percent_encode(token, URL_SAFE),
+        utf8_percent_encode(file_key, URL_SAFE),
     )
 }
 
@@ -531,7 +531,7 @@ pub fn download_url(base_url: &str, token: &str, name: &str) -> String {
 pub fn rewrite_config(
     config: &str,
     base_url: &str,
-    token: &str,
+    file_key: &str,
     converted: &HashSet<String>,
 ) -> Result<String> {
     let mut value: Value = serde_yaml::from_str(config).context("the config is not valid YAML")?;
@@ -550,7 +550,7 @@ pub fn rewrite_config(
         let Some(body) = body.as_mapping_mut() else {
             continue;
         };
-        let url = download_url(base_url, token, name);
+        let url = download_url(base_url, file_key, name);
         body.insert(Value::from("url"), Value::from(url));
         body.insert(Value::from("format"), Value::from("mrs"));
     }
@@ -705,7 +705,7 @@ rule-providers:
 ";
         let converted: HashSet<String> = ["google".to_owned()].into();
         let rewritten = rewrite_config(config, "http://10.0.0.1:8080/", "abc", &converted).unwrap();
-        assert!(rewritten.contains("http://10.0.0.1:8080/files/google.mrs?token=abc"));
+        assert!(rewritten.contains("http://10.0.0.1:8080/files/google.mrs?key=abc"));
         assert!(rewritten.contains("format: mrs"));
         assert!(rewritten.contains("path: ./google.yaml"));
         assert!(rewritten.contains("https://example.com/ads.list"));

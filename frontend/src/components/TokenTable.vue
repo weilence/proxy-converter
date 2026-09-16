@@ -78,6 +78,31 @@ async function duplicate() {
 
 const deleting = ref<TokenInfo | null>(null)
 const removing = ref(false)
+
+const keyResetting = ref<TokenInfo | null>(null)
+const keyResetBusy = ref(false)
+const keyResetOpen = computed({
+  get: () => keyResetting.value !== null,
+  set: (value: boolean) => {
+    if (!value) keyResetting.value = null
+  },
+})
+
+async function resetFileKey() {
+  const row = keyResetting.value
+  if (!row || keyResetBusy.value) return
+  keyResetBusy.value = true
+  try {
+    await api.resetFileKey(row.id)
+    toast.add({ title: '文件密钥已重置，旧下载链接已失效', color: 'success' })
+    keyResetting.value = null
+    emit('reload')
+  } catch (err) {
+    toast.add({ title: describe(err, '重置失败'), color: 'error' })
+  } finally {
+    keyResetBusy.value = false
+  }
+}
 const deleteOpen = computed({
   get: () => deleting.value !== null,
   set: (value) => {
@@ -160,6 +185,9 @@ const columns: TableColumn<TokenInfo>[] = [
           <UButton size="xs" color="neutral" variant="soft" @click="duplicating = row.original">
             复制
           </UButton>
+          <UButton size="xs" color="neutral" variant="soft" @click="keyResetting = row.original">
+            重置密钥
+          </UButton>
           <UButton size="xs" color="neutral" variant="soft" @click="toggleEnabled(row.original)">
             {{ row.original.status === 'disabled' ? '启用' : '停用' }}
           </UButton>
@@ -195,6 +223,19 @@ const columns: TableColumn<TokenInfo>[] = [
         <div class="flex w-full justify-end gap-2">
           <UButton color="neutral" variant="soft" @click="dupOpen = false">取消</UButton>
           <UButton :loading="duplicatingBusy" @click="duplicate">复制</UButton>
+        </div>
+      </template>
+    </UModal>
+
+    <UModal
+      v-model:open="keyResetOpen"
+      title="重置文件密钥"
+      :description="`将为令牌「${keyResetting?.token}」生成新的文件密钥并改写配置中的下载链接，旧链接立即失效，客户端下次拉取配置时自动使用新链接。适合配置文件外泄后的止损。`"
+    >
+      <template #footer>
+        <div class="flex w-full justify-end gap-2">
+          <UButton color="neutral" variant="soft" @click="keyResetOpen = false">取消</UButton>
+          <UButton color="warning" :loading="keyResetBusy" @click="resetFileKey">重置</UButton>
         </div>
       </template>
     </UModal>

@@ -6,7 +6,7 @@ Rust web service that serves token-bound mihomo/Clash YAML configs as `config.ya
 
 - `src/main.rs` — clap CLI (`run` subcommand), `.env` loading, tracing init
 - `src/server.rs` — axum router; public routes `GET /config?token=` and `GET /files/{name}?token=`; graceful shutdown
-- `src/admin.rs` — `/admin` UI + `/admin/api/*`: cookie session auth (8h TTL), token CRUD, orchestrates mrs/geo downloads and conversion
+- `src/admin.rs` — `/admin` UI + `/admin/api/*`: cookie session auth (8h TTL), global failed-login lockout (in-memory, exponential backoff), token CRUD, orchestrates mrs/geo downloads and conversion
 - `src/db.rs` — SeaORM/SQLite layer; schema is `CREATE TABLE IF NOT EXISTS` statements here (no migration framework)
 - `src/entity/` — SeaORM entities (`token`, `hosted_file`)
 - `src/mrs.rs` — pure-Rust encoder for mihomo's `.mrs` binary format (zstd + LOUDS trie); byte-compatible with `mihomo convert-ruleset`; no I/O
@@ -21,6 +21,7 @@ Rust web service that serves token-bound mihomo/Clash YAML configs as `config.ya
 - Keep all SeaORM/SQLite access inside `src/db.rs`; handlers never touch the ORM directly.
 - `mrs.rs` is pure computation (no I/O, no HTTP); `admin.rs` performs all downloading/fetching.
 - Hosted files are private per token: names never collide across tokens (`db.rs` keys them by token id).
+- `/files` authenticates only with the token's `file_key` (`?key=`), kept separate from the subscription `token` so a leaked config does not expose the config-fetch credential. `duplicate`/`reset-file-key` re-point every credential occurrence in the stored config at the new key.
 
 ## Gotchas
 

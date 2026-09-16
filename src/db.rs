@@ -14,6 +14,7 @@ use crate::entity::{hosted_file, token};
 const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS tokens (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     token        TEXT NOT NULL UNIQUE,
+    file_key     TEXT NOT NULL DEFAULT '',
     name         TEXT NOT NULL DEFAULT '',
     config       TEXT NOT NULL DEFAULT '',
     enabled      INTEGER NOT NULL DEFAULT 1,
@@ -54,8 +55,17 @@ impl Db {
     /// Check whether a token is currently valid; on success return its
     /// record and mark its use.
     pub async fn verify(&self, token: &str) -> Option<token::Model> {
+        self.verify_by(token::Column::Token, token).await
+    }
+
+    /// Check a file key with the same validity rules as [`Db::verify`].
+    pub async fn verify_file_key(&self, key: &str) -> Option<token::Model> {
+        self.verify_by(token::Column::FileKey, key).await
+    }
+
+    async fn verify_by(&self, column: token::Column, value: &str) -> Option<token::Model> {
         let found = token::Entity::find()
-            .filter(token::Column::Token.eq(token))
+            .filter(column.eq(value))
             .filter(token::Column::Enabled.eq(true))
             .filter(
                 Condition::any()
@@ -69,7 +79,7 @@ impl Db {
 
         if found.is_some() {
             let _ = token::Entity::update_many()
-                .filter(token::Column::Token.eq(token))
+                .filter(column.eq(value))
                 .set(token::ActiveModel {
                     last_used_at: Set(Some(now())),
                     ..Default::default()
@@ -81,15 +91,17 @@ impl Db {
         found
     }
 
-    /// Insert a token with a freshly generated random value; returns the new
-    /// record.
+    /// Insert a token with freshly generated random values (subscription
+    /// token and file key); returns the new record.
     pub async fn add(&self, name: &str, days: Option<i64>, config: &str) -> Result<token::Model> {
         let config = normalize_config(config)?;
         let txn = self.conn.begin().await?;
         let token = unused_token(&txn).await?;
+        let file_key = unused_file_key(&txn).await?;
 
         let inserted = token::ActiveModel {
             token: Set(token),
+            file_key: Set(file_key),
             name: Set(name.to_owned()),
             config: Set(config),
             enabled: Set(true),
@@ -114,12 +126,13 @@ impl Db {
             .context("failed to fetch the token")
     }
 
-    /// Duplicate a token: a fresh random token value with the same name,
-    /// expiry and config, plus copies of all its hosted files. Hosted links
-    /// inside the config are re-pointed at the new token value, so the copy
+    /// Duplicate a token: fresh random token value and file key with the
+    /// same name, expiry and config, plus copies of all its hosted files.
+    /// Hosted links inside the config are re-pointed at the new file key
+    /// (legacy `token=` links are upgraded to `key=` form), so the copy
     /// keeps working if the source is later deleted or disabled. The copy
-    /// starts enabled and unused; returns the new record, or `None` when the
-    /// source token does not exist.
+    /// starts enabled and unused; returns the new record, or `None` when
+    /// the source token does not exist.
     pub async fn duplicate(&self, id: i32) -> Result<Option<token::Model>> {
         let txn = self.conn.begin().await?;
         let Some(source) = token::Entity::find_by_id(id)
@@ -130,10 +143,13 @@ impl Db {
             return Ok(None);
         };
         let new_token = unused_token(&txn).await?;
-        let new_config = swap_token_in_config(&source.config, &source.token, &new_token);
+        let new_key = unused_file_key(&txn).await?;
+        let new_config =
+            repoint_file_links(&source.config, &source.token, &source.file_key, &new_key);
 
         let inserted = token::ActiveModel {
             token: Set(new_token),
+            file_key: Set(new_key),
             name: Set(source.name.clone()),
             config: Set(new_config),
             enabled: Set(true),
@@ -214,6 +230,37 @@ impl Db {
             .await
             .map(|result| result.rows_affected)
             .context("failed to update the token")
+    }
+
+    /// Rotate a token's file key and re-point every hosted link in its
+    /// config (legacy `token=` links included) at the fresh key, so clients
+    /// pick up new URLs on their next config fetch. Returns the updated
+    /// record, or `None` when the token does not exist.
+    pub async fn reset_file_key(&self, id: i32) -> Result<Option<token::Model>> {
+        let txn = self.conn.begin().await?;
+        let Some(record) = token::Entity::find_by_id(id)
+            .one(&txn)
+            .await
+            .context("failed to fetch the token")?
+        else {
+            return Ok(None);
+        };
+        let new_key = unused_file_key(&txn).await?;
+        let config = repoint_file_links(&record.config, &record.token, &record.file_key, &new_key);
+
+        token::Entity::update_many()
+            .filter(token::Column::Id.eq(id))
+            .set(token::ActiveModel {
+                file_key: Set(new_key),
+                config: Set(config),
+                ..Default::default()
+            })
+            .exec(&txn)
+            .await
+            .context("failed to reset the file key")?;
+        txn.commit().await?;
+
+        self.get(id).await
     }
 
     /// List all tokens, oldest first.
@@ -328,18 +375,26 @@ async fn delete_hosted_files(txn: &DatabaseTransaction, token_id: i32) -> Result
         .context("failed to delete the token's hosted files")
 }
 
-/// Re-point hosted download links at a new token value: rewrite every
-/// `token=<old>` occurrence in the config, in raw or percent-encoded form
-/// (the form `download_url` writes).
-fn swap_token_in_config(config: &str, old: &str, new: &str) -> String {
+/// Re-point hosted download links at a new file key: rewrite every
+/// `key=<old_key>` and legacy `token=<old_token>` occurrence in the config,
+/// in raw or percent-encoded form (the form `download_url` writes).
+fn repoint_file_links(config: &str, old_token: &str, old_key: &str, new_key: &str) -> String {
     let encode = |value: &str| utf8_percent_encode(value, crate::mrs::URL_SAFE).to_string();
-    let mut swapped = config.replace(&format!("token={old}"), &format!("token={new}"));
-    let (encoded_old, encoded_new) = (encode(old), encode(new));
-    if encoded_old != old {
-        swapped = swapped.replace(
-            &format!("token={encoded_old}"),
-            &format!("token={encoded_new}"),
-        );
+    let mut forms = Vec::new();
+    for old in [old_token, old_key] {
+        if old.is_empty() {
+            continue;
+        }
+        forms.push(old.to_owned());
+        let encoded = encode(old);
+        if encoded != old {
+            forms.push(encoded);
+        }
+    }
+    let mut swapped = config.to_owned();
+    for form in forms {
+        swapped = swapped.replace(&format!("token={form}"), &format!("key={new_key}"));
+        swapped = swapped.replace(&format!("key={form}"), &format!("key={new_key}"));
     }
     swapped
 }
@@ -348,7 +403,8 @@ fn swap_token_in_config(config: &str, old: &str, new: &str) -> String {
 const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const TOKEN_LENGTH: usize = 16;
 
-/// A random URL-safe token value, 96 bits of entropy.
+/// A random URL-safe secret value, 96 bits of entropy; used for both the
+/// subscription token and the file key.
 fn generate_token() -> String {
     use rand::RngExt;
     let mut rng = rand::rng();
@@ -359,13 +415,22 @@ fn generate_token() -> String {
 
 /// A generated token value not yet present in the database.
 async fn unused_token(txn: &DatabaseTransaction) -> Result<String> {
+    unused_value(txn, token::Column::Token).await
+}
+
+/// A generated file key not yet present in the database.
+async fn unused_file_key(txn: &DatabaseTransaction) -> Result<String> {
+    unused_value(txn, token::Column::FileKey).await
+}
+
+async fn unused_value(txn: &DatabaseTransaction, column: token::Column) -> Result<String> {
     loop {
         let candidate = generate_token();
         let taken = token::Entity::find()
-            .filter(token::Column::Token.eq(&candidate))
+            .filter(column.eq(&candidate))
             .one(txn)
             .await
-            .context("failed to check the token value")?
+            .context("failed to check the generated value")?
             .is_some();
         if !taken {
             return Ok(candidate);
@@ -423,22 +488,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn swap_token_rewrites_raw_and_encoded_links() {
+    fn repoint_rewrites_raw_encoded_and_legacy_links() {
         let config = "\
 rule-providers:
   a:
     url: http://h/files/a.mrs?token=tok+1
 geox-url:
   geoip: http://h/files/geoip?token=tok%2B1
+  mmdb: http://h/files/mmdb?key=oldkey
 unrelated:
   secret: token=other-value
 ";
-        let swapped = swap_token_in_config(config, "tok+1", "new");
-        assert!(swapped.contains("a.mrs?token=new"));
-        assert!(swapped.contains("geoip?token=new"));
-        // Different token values stay untouched.
-        assert!(swapped.contains("token=other-value"));
-        assert!(!swapped.contains("tok%2B1"));
+        let repointed = repoint_file_links(config, "tok+1", "oldkey", "newkey");
+        // Legacy token links upgrade to the key form.
+        assert!(repointed.contains("a.mrs?key=newkey"));
+        assert!(repointed.contains("geoip?key=newkey"));
+        assert!(repointed.contains("mmdb?key=newkey"));
+        // Different credential values stay untouched.
+        assert!(repointed.contains("token=other-value"));
+        assert!(!repointed.contains("tok+1"));
+        assert!(!repointed.contains("tok%2B1"));
+        assert!(!repointed.contains("oldkey"));
+    }
+
+    #[test]
+    fn repoint_skips_empty_credentials() {
+        let config = "url: http://h/files/a.mrs?token=abc\nother: token=\n";
+        // An empty old key must not turn bare `token=` into a match.
+        let repointed = repoint_file_links(config, "abc", "", "newkey");
+        assert!(repointed.contains("a.mrs?key=newkey"));
+        assert!(repointed.contains("other: token="));
     }
 }
 
@@ -459,41 +538,41 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
         conn.execute_unprepared(CREATE_TABLE_SQL)
             .await
             .context("failed to create the `tokens` table")?;
-        return create_hosted_table(conn).await;
-    }
-
-    let has_id = conn
-        .query_one(query(
-            "SELECT 1 FROM pragma_table_info('tokens') WHERE name = 'id'",
-        ))
-        .await
-        .context("failed to inspect the `tokens` table")?
-        .is_some();
-
-    if has_id {
-        // v0.2: tokens gained a bound config.
-        add_config_column_if_missing(conn).await?;
-        return create_hosted_table(conn).await;
-    }
-
-    tracing::info!("Migrating the `tokens` table to the new schema");
-    for statement in [
-        "ALTER TABLE tokens RENAME TO tokens_legacy".to_owned(),
-        CREATE_TABLE_SQL.to_owned(),
-        "INSERT INTO tokens (token, name, enabled, expires_at, created_at, last_used_at)
-         SELECT token, name, enabled,
-                datetime(expires_at, 'unixepoch'),
-                datetime(created_at, 'unixepoch'),
-                datetime(last_used_at, 'unixepoch')
-         FROM tokens_legacy"
-            .to_owned(),
-        "DROP TABLE tokens_legacy".to_owned(),
-    ] {
-        conn.execute_unprepared(&statement)
+    } else {
+        let has_id = conn
+            .query_one(query(
+                "SELECT 1 FROM pragma_table_info('tokens') WHERE name = 'id'",
+            ))
             .await
-            .context("failed to migrate the `tokens` table")?;
+            .context("failed to inspect the `tokens` table")?
+            .is_some();
+
+        if has_id {
+            // v0.2: tokens gained a bound config.
+            add_config_column_if_missing(conn).await?;
+        } else {
+            tracing::info!("Migrating the `tokens` table to the new schema");
+            for statement in [
+                "ALTER TABLE tokens RENAME TO tokens_legacy".to_owned(),
+                CREATE_TABLE_SQL.to_owned(),
+                "INSERT INTO tokens (token, name, enabled, expires_at, created_at, last_used_at)
+                 SELECT token, name, enabled,
+                        datetime(expires_at, 'unixepoch'),
+                        datetime(created_at, 'unixepoch'),
+                        datetime(last_used_at, 'unixepoch')
+                 FROM tokens_legacy"
+                    .to_owned(),
+                "DROP TABLE tokens_legacy".to_owned(),
+            ] {
+                conn.execute_unprepared(&statement)
+                    .await
+                    .context("failed to migrate the `tokens` table")?;
+            }
+        }
     }
 
+    // v0.3: tokens gained a file key separate from the subscription token.
+    ensure_file_key(conn).await?;
     create_hosted_table(conn).await
 }
 
@@ -550,5 +629,66 @@ async fn add_config_column_if_missing(conn: &DatabaseConnection) -> Result<()> {
             .context("failed to add the `config` column")?;
     }
 
+    Ok(())
+}
+
+/// Ensure every token has a file key: add the column to pre-v0.3 databases
+/// and backfill rows that lack one, re-pointing any legacy `token=` hosted
+/// links in their configs at the fresh key (the `/files` endpoint no longer
+/// accepts the token credential). Uniqueness is enforced with an index,
+/// added only after the backfill, since the empty placeholder repeats.
+async fn ensure_file_key(conn: &DatabaseConnection) -> Result<()> {
+    let has_file_key = conn
+        .query_one(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT 1 FROM pragma_table_info('tokens') WHERE name = 'file_key'".to_owned(),
+        ))
+        .await
+        .context("failed to inspect the `tokens` table")?
+        .is_some();
+
+    if !has_file_key {
+        conn.execute_unprepared("ALTER TABLE tokens ADD COLUMN file_key TEXT NOT NULL DEFAULT ''")
+            .await
+            .context("failed to add the `file_key` column")?;
+    }
+
+    let rows = conn
+        .query_all(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT id, token, config FROM tokens WHERE file_key = ''".to_owned(),
+        ))
+        .await
+        .context("failed to list tokens without a file key")?;
+    let backfilled = rows.len();
+    for row in rows {
+        let id: i32 = row
+            .try_get("", "id")
+            .context("failed to read a token id during the file key backfill")?;
+        let token: String = row
+            .try_get("", "token")
+            .context("failed to read a token value during the file key backfill")?;
+        let config: String = row
+            .try_get("", "config")
+            .context("failed to read a config during the file key backfill")?;
+        let file_key = generate_token();
+        let config = repoint_file_links(&config, &token, "", &file_key);
+        conn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE tokens SET file_key = $1, config = $2 WHERE id = $3",
+            [file_key.into(), config.into(), id.into()],
+        ))
+        .await
+        .context("failed to backfill a file key")?;
+    }
+    if backfilled > 0 {
+        tracing::info!("Backfilled file keys for {backfilled} token(s)");
+    }
+
+    conn.execute_unprepared(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_file_key ON tokens(file_key)",
+    )
+    .await
+    .context("failed to index the file key column")?;
     Ok(())
 }

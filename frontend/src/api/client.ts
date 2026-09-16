@@ -43,6 +43,13 @@ export const api = {
       body: JSON.stringify({ password }),
     })
     if (res.status === 401) throw new ApiError(401, '密码错误')
+    if (res.status === 429) {
+      const retry = Number(res.headers.get('Retry-After'))
+      throw new ApiError(
+        429,
+        retry > 0 ? `尝试次数过多，请在 ${retry} 秒后重试` : '尝试次数过多，请稍后重试',
+      )
+    }
     if (!res.ok) throw new ApiError(res.status, `登录失败 (${res.status})`)
   },
 
@@ -112,6 +119,13 @@ export const api = {
   async duplicateToken(id: number): Promise<TokenInfo> {
     const res = await request(`/admin/api/tokens/${id}/duplicate`, { method: 'POST' })
     if (!res.ok) throw new ApiError(res.status, await errorText(res, '复制失败'))
+    return res.json()
+  },
+
+  /** Rotate a token's file key and re-point its config's hosted links. */
+  async resetFileKey(id: number): Promise<TokenInfo> {
+    const res = await request(`/admin/api/tokens/${id}/reset-file-key`, { method: 'POST' })
+    if (!res.ok) throw new ApiError(res.status, await errorText(res, '重置失败'))
     return res.json()
   },
 

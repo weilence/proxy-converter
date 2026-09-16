@@ -7,6 +7,10 @@ pub struct Model {
     pub id: i32,
     #[sea_orm(unique)]
     pub token: String,
+    /// Credential embedded in the config's hosted-file URLs; separate from
+    /// `token` so a leaked config does not expose the subscription token.
+    #[sea_orm(unique)]
+    pub file_key: String,
     pub name: String,
     pub config: String,
     pub enabled: bool,

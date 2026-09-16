@@ -67,12 +67,12 @@ pub fn resolve_sources(config: &str) -> Result<Vec<(&'static str, String)>> {
 }
 
 /// Public download URL for a token's hosted geo file.
-pub fn download_url(base_url: &str, token: &str, name: &str) -> String {
+pub fn download_url(base_url: &str, file_key: &str, name: &str) -> String {
     format!(
-        "{}/files/{}?token={}",
+        "{}/files/{}?key={}",
         base_url.trim_end_matches('/'),
         utf8_percent_encode(name, URL_SAFE),
-        utf8_percent_encode(token, URL_SAFE),
+        utf8_percent_encode(file_key, URL_SAFE),
     )
 }
 
@@ -82,7 +82,7 @@ pub fn download_url(base_url: &str, token: &str, name: &str) -> String {
 pub fn rewrite_config(
     config: &str,
     base_url: &str,
-    token: &str,
+    file_key: &str,
     converted: &HashSet<String>,
 ) -> Result<String> {
     if converted.is_empty() {
@@ -106,7 +106,7 @@ pub fn rewrite_config(
         if converted.contains(file.key) {
             geox.insert(
                 Value::from(file.key),
-                Value::from(download_url(base_url, token, file.key)),
+                Value::from(download_url(base_url, file_key, file.key)),
             );
         }
     }
@@ -158,15 +158,15 @@ geox-url:
         let config = "mode: rule\n";
         let converted: HashSet<String> = ["geoip".to_owned()].into();
         let rewritten = rewrite_config(config, "http://10.0.0.1:8080/", "abc", &converted).unwrap();
-        assert!(rewritten.contains("geoip: http://10.0.0.1:8080/files/geoip?token=abc"));
+        assert!(rewritten.contains("geoip: http://10.0.0.1:8080/files/geoip?key=abc"));
         assert!(!rewritten.contains("geosite:"));
 
         // An existing section keeps its untouched keys.
         let config = "geox-url:\n  mmdb: https://github.com/x/mmdb\n";
         let converted: HashSet<String> = ["mmdb".to_owned(), "asn".to_owned()].into();
         let rewritten = rewrite_config(config, "http://10.0.0.1:8080/", "abc", &converted).unwrap();
-        assert!(rewritten.contains("mmdb: http://10.0.0.1:8080/files/mmdb?token=abc"));
-        assert!(rewritten.contains("asn: http://10.0.0.1:8080/files/asn?token=abc"));
+        assert!(rewritten.contains("mmdb: http://10.0.0.1:8080/files/mmdb?key=abc"));
+        assert!(rewritten.contains("asn: http://10.0.0.1:8080/files/asn?key=abc"));
     }
 
     #[test]
