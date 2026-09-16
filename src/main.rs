@@ -3,6 +3,7 @@ mod admin;
 mod assets;
 mod db;
 mod entity;
+mod mrs;
 mod server;
 
 use std::{net::SocketAddr, path::PathBuf};

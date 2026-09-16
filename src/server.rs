@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::{Context as _, Result};
 use axum::{
     Router,
-    extract::{Query, RawQuery, State},
+    extract::{Path, Query, RawQuery, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -34,6 +34,7 @@ pub async fn run(addr: SocketAddr, database: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/config", get(config))
         .route("/convert", get(convert))
+        .route("/mrs/{name}", get(mrs))
         .merge(crate::admin::routes())
         .with_state(state);
 
@@ -80,6 +81,44 @@ async fn convert(RawQuery(query): RawQuery) -> Response {
         Ok(location) => (StatusCode::FOUND, [(header::LOCATION, location)]).into_response(),
         Err(_) => (StatusCode::FOUND, "moved to /config").into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct MrsParams {
+    token: Option<String>,
+}
+
+/// Serve one of the token's converted rule files, e.g. `/mrs/google.mrs`.
+/// The file set is private per token: names never collide across tokens.
+async fn mrs(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<MrsParams>,
+) -> Result<Response, AppError> {
+    let provided = params.token.as_deref().unwrap_or_default();
+    let Some(record) = state.db.verify(provided).await else {
+        return Err(AppError::new(StatusCode::UNAUTHORIZED, "Unauthorized"));
+    };
+
+    let file_name = name.strip_suffix(".mrs").unwrap_or(&name);
+    let file = state
+        .db
+        .get_mrs_file(record.id, file_name)
+        .await
+        .map_err(|err| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "no such mrs file"))?;
+
+    let disposition = format!("attachment; filename={file_name}.mrs");
+    let mut response = Response::new(axum::body::Body::from(file.content));
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok(response)
 }
 
 /// Build the downloadable `config.yaml` response; an empty body means the

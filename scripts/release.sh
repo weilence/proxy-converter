@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 
 (
   cd frontend
-  npm ci
+  npm install
   npm run build
 )
 

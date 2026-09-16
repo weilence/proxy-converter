@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { TableColumn } from '@nuxt/ui'
+import { computed, ref } from 'vue'
 import { api, ApiError } from '../api/client'
 import type { TokenInfo, TokenStatus } from '../api/types'
 
@@ -40,15 +41,31 @@ async function toggleEnabled(row: TokenInfo) {
   emit('reload')
 }
 
-async function remove(row: TokenInfo) {
-  if (!window.confirm(`确定删除令牌「${row.token}」吗？删除后立即失效。`)) return
+const deleting = ref<TokenInfo | null>(null)
+const removing = ref(false)
+const deleteOpen = computed({
+  get: () => deleting.value !== null,
+  set: (value) => {
+    if (!value) deleting.value = null
+  },
+})
+
+const converting = ref<TokenInfo | null>(null)
+
+async function remove() {
+  const row = deleting.value
+  if (!row || removing.value) return
+  removing.value = true
   try {
     await api.removeToken(row.id)
     toast.add({ title: '已删除', color: 'success' })
+    deleting.value = null
+    emit('reload')
   } catch (err) {
     toast.add({ title: describe(err, '删除失败'), color: 'error' })
+  } finally {
+    removing.value = false
   }
-  emit('reload')
 }
 
 const columns: TableColumn<TokenInfo>[] = [
@@ -87,12 +104,15 @@ const columns: TableColumn<TokenInfo>[] = [
       <template #actions-cell="{ row }">
         <div class="flex gap-1.5">
           <UButton size="xs" color="neutral" variant="soft" @click="emit('edit', row.original)">
-            配置
+            修改
+          </UButton>
+          <UButton size="xs" color="neutral" variant="soft" @click="converting = row.original">
+            转 mrs
           </UButton>
           <UButton size="xs" color="neutral" variant="soft" @click="toggleEnabled(row.original)">
             {{ row.original.status === 'disabled' ? '启用' : '停用' }}
           </UButton>
-          <UButton size="xs" color="error" variant="soft" @click="remove(row.original)">
+          <UButton size="xs" color="error" variant="soft" @click="deleting = row.original">
             删除
           </UButton>
         </div>
@@ -101,5 +121,20 @@ const columns: TableColumn<TokenInfo>[] = [
         <p class="py-7 text-center text-sm text-muted">还没有令牌，先添加一个吧。</p>
       </template>
     </UTable>
+
+    <UModal
+      v-model:open="deleteOpen"
+      title="删除令牌"
+      :description="`确定删除令牌「${deleting?.token}」吗？删除后立即失效。`"
+    >
+      <template #footer>
+        <div class="flex w-full justify-end gap-2">
+          <UButton color="neutral" variant="soft" @click="deleteOpen = false">取消</UButton>
+          <UButton color="error" :loading="removing" @click="remove">删除</UButton>
+        </div>
+      </template>
+    </UModal>
+
+    <MrsDialog v-model:token="converting" @saved="emit('reload')" />
   </div>
 </template>

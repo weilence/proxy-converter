@@ -1,0 +1,4 @@
+payload:
+  - 'example.com'
+  - '+.google.com'
+  - '*.example.org'

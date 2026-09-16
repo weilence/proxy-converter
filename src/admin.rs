@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -15,10 +15,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::sleep;
 
-use crate::{db, entity::Token, server::AppState};
+use crate::{db, db::NewMrsFile, entity::Token, mrs, server::AppState};
 
 const SESSION_COOKIE: &str = "admin_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// Download timeout for mrs source fetching.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Admin authentication state. The admin page is disabled unless the
 /// `ADMIN_PASSWORD` environment variable is set to a non-empty value.
@@ -53,6 +56,11 @@ pub fn routes() -> Router<AppState> {
         .route("/admin/api/tokens/{id}/enable", post(enable_token))
         .route("/admin/api/tokens/{id}/disable", post(disable_token))
         .route("/admin/api/tokens/{id}/config", post(set_token_config))
+        .route("/admin/api/tokens/{id}/name", post(set_token_name))
+        .route(
+            "/admin/api/tokens/{id}/convert-mrs",
+            post(convert_token_mrs),
+        )
         .route("/admin/api/tokens/{id}", delete(remove_token));
 
     #[cfg(not(debug_assertions))]
@@ -130,10 +138,10 @@ async fn login(State(state): State<AppState>, Json(payload): Json<LoginPayload>)
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(session) = session_id_from_headers(&headers) {
-        if let Ok(mut sessions) = state.admin.sessions.lock() {
-            sessions.remove(&session);
-        }
+    if let Some(session) = session_id_from_headers(&headers)
+        && let Ok(mut sessions) = state.admin.sessions.lock()
+    {
+        sessions.remove(&session);
     }
 
     let mut response = Json(json!({ "ok": true })).into_response();
@@ -248,12 +256,160 @@ async fn set_token_config(
     }
 }
 
+#[derive(Deserialize)]
+struct SetNamePayload {
+    name: String,
+}
+
+async fn set_token_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+    Json(payload): Json<SetNamePayload>,
+) -> Response {
+    if let Err(response) = guard(&state, &headers) {
+        return response;
+    }
+
+    match state.db.set_name(id, payload.name.trim()).await {
+        Ok(0) => (StatusCode::NOT_FOUND, "token not found").into_response(),
+        Ok(_) => (StatusCode::OK, "ok").into_response(),
+        Err(err) => internal(err),
+    }
+}
+
 async fn enable_token(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i32>,
 ) -> Response {
     update_enabled(state, headers, id, true).await
+}
+
+#[derive(Deserialize)]
+struct ConvertMrsPayload {
+    base_url: String,
+}
+
+#[derive(Serialize)]
+struct MrsProviderResult {
+    name: String,
+    behavior: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MrsConvertResponse {
+    results: Vec<MrsProviderResult>,
+    config: String,
+}
+
+/// Convert the token's `rule-providers` to hosted mrs files and return the
+/// rewritten config for review. The token's own config is left untouched.
+async fn convert_token_mrs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+    Json(payload): Json<ConvertMrsPayload>,
+) -> Response {
+    if let Err(response) = guard(&state, &headers) {
+        return response;
+    }
+
+    let base_url = match normalize_base_url(&payload.base_url) {
+        Ok(base_url) => base_url,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+
+    let Some(record) = (match state.db.get(id).await {
+        Ok(record) => record,
+        Err(err) => return internal(err),
+    }) else {
+        return (StatusCode::NOT_FOUND, "token not found").into_response();
+    };
+    if record.config.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "the token has no config").into_response();
+    }
+    let providers = match mrs::parse_rule_providers(&record.config) {
+        Ok(providers) => providers,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    if providers.is_empty() {
+        return (StatusCode::BAD_REQUEST, "the config has no rule-providers").into_response();
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .user_agent(concat!("proxy-converter/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return internal(anyhow::anyhow!("failed to build the HTTP client: {err}")),
+    };
+
+    let mut results = Vec::with_capacity(providers.len());
+    let mut converted = HashSet::new();
+    let mut files = Vec::new();
+    for provider in providers {
+        let outcome = mrs::convert_provider(&client, &record.token, &base_url, &provider).await;
+        let (status, size, url, reason, error) = match &outcome {
+            mrs::ProviderOutcome::Converted { size, url, .. } => {
+                ("converted", Some(*size), Some(url.clone()), None, None)
+            }
+            mrs::ProviderOutcome::Skipped { reason } => {
+                ("skipped", None, None, Some(*reason), None)
+            }
+            mrs::ProviderOutcome::Failed { error } => {
+                ("failed", None, None, None, Some(error.to_string()))
+            }
+        };
+        if let mrs::ProviderOutcome::Converted { content, .. } = outcome {
+            files.push(NewMrsFile {
+                name: provider.name.clone(),
+                source_url: provider.url.clone(),
+                content,
+            });
+            converted.insert(provider.name.clone());
+        }
+        results.push(MrsProviderResult {
+            name: provider.name,
+            behavior: provider.behavior,
+            status,
+            size,
+            url,
+            reason,
+            error,
+        });
+    }
+
+    if let Err(err) = state.db.set_mrs_files(id, files).await {
+        return internal(err);
+    }
+    let config = match mrs::rewrite_config(&record.config, &base_url, &record.token, &converted) {
+        Ok(config) => config,
+        Err(err) => return internal(err),
+    };
+
+    Json(MrsConvertResponse { results, config }).into_response()
+}
+
+fn normalize_base_url(raw: &str) -> Result<String, &'static str> {
+    let url = reqwest::Url::parse(raw.trim()).map_err(|_| "base_url is not a valid URL")?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("base_url must be an http or https URL");
+    }
+    if url.host_str().is_none() || url.host_str() == Some("") {
+        return Err("base_url must include a host");
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 async fn disable_token(
@@ -293,6 +449,7 @@ async fn remove_token(
 }
 
 /// Reject disabled admin pages and unauthenticated requests.
+#[allow(clippy::result_large_err)] // a boxed error type would not simplify the callers
 fn guard(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     if !state.admin.enabled() {
         return Err((StatusCode::NOT_FOUND, "admin page is disabled").into_response());

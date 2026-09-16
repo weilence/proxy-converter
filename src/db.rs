@@ -4,10 +4,11 @@ use anyhow::{Context as _, Result};
 use chrono::{Local, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, Database, DatabaseBackend,
-    DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set, Statement, prelude::DateTime,
+    DatabaseConnection, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, Set, Statement,
+    TransactionTrait, prelude::DateTime,
 };
 
-use crate::entity::token;
+use crate::entity::{mrs_file, token};
 
 const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS tokens (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -18,6 +19,16 @@ const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS tokens (
     expires_at   TEXT,
     created_at   TEXT NOT NULL,
     last_used_at TEXT
+)";
+
+const CREATE_MRS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS mrs_files (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id   INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    content    BLOB NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (token_id, name)
 )";
 
 /// SQLite-backed token store built on SeaORM. Tokens are valid when they
@@ -104,13 +115,26 @@ impl Db {
         Ok(true)
     }
 
-    /// Delete a token by id; returns the number of removed rows.
+    /// Fetch a token by id.
+    pub async fn get(&self, id: i32) -> Result<Option<token::Model>> {
+        token::Entity::find_by_id(id)
+            .one(&self.conn)
+            .await
+            .context("failed to fetch the token")
+    }
+
+    /// Delete a token by id along with its hosted mrs files; returns the
+    /// number of removed token rows.
     pub async fn remove(&self, id: i32) -> Result<u64> {
-        token::Entity::delete_by_id(id)
-            .exec(&self.conn)
+        let txn = self.conn.begin().await?;
+        delete_mrs_files(&txn, id).await?;
+        let removed = token::Entity::delete_by_id(id)
+            .exec(&txn)
             .await
             .map(|result| result.rows_affected)
-            .context("failed to delete the token")
+            .context("failed to delete the token")?;
+        txn.commit().await?;
+        Ok(removed)
     }
 
     /// Enable or disable a token by id; returns the number of updated rows.
@@ -142,6 +166,20 @@ impl Db {
             .context("failed to update the token")
     }
 
+    /// Rename a token by id; returns the number of updated rows.
+    pub async fn set_name(&self, id: i32, name: &str) -> Result<u64> {
+        token::Entity::update_many()
+            .filter(token::Column::Id.eq(id))
+            .set(token::ActiveModel {
+                name: Set(name.to_owned()),
+                ..Default::default()
+            })
+            .exec(&self.conn)
+            .await
+            .map(|result| result.rows_affected)
+            .context("failed to update the token")
+    }
+
     /// List all tokens, oldest first.
     pub async fn list(&self) -> Result<Vec<token::Model>> {
         token::Entity::find()
@@ -150,6 +188,53 @@ impl Db {
             .await
             .context("failed to list the tokens")
     }
+
+    /// Replace the mrs files hosted for a token with a fresh conversion run.
+    pub async fn set_mrs_files(&self, token_id: i32, files: Vec<NewMrsFile>) -> Result<()> {
+        let txn = self.conn.begin().await?;
+        delete_mrs_files(&txn, token_id).await?;
+        for file in files {
+            mrs_file::ActiveModel {
+                token_id: Set(token_id),
+                name: Set(file.name),
+                source_url: Set(file.source_url),
+                content: Set(file.content),
+                updated_at: Set(now()),
+                ..Default::default()
+            }
+            .insert(&txn)
+            .await
+            .context("failed to store the mrs file")?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Fetch one of a token's mrs files by provider name.
+    pub async fn get_mrs_file(&self, token_id: i32, name: &str) -> Result<Option<mrs_file::Model>> {
+        mrs_file::Entity::find()
+            .filter(mrs_file::Column::TokenId.eq(token_id))
+            .filter(mrs_file::Column::Name.eq(name))
+            .one(&self.conn)
+            .await
+            .context("failed to fetch the mrs file")
+    }
+}
+
+/// A new mrs file to host for a token.
+pub struct NewMrsFile {
+    pub name: String,
+    pub source_url: String,
+    pub content: Vec<u8>,
+}
+
+async fn delete_mrs_files(txn: &DatabaseTransaction, token_id: i32) -> Result<()> {
+    mrs_file::Entity::delete_many()
+        .filter(mrs_file::Column::TokenId.eq(token_id))
+        .exec(txn)
+        .await
+        .map(|_| ())
+        .context("failed to delete the token's mrs files")
 }
 
 /// Current UTC time; stored as `YYYY-MM-DD HH:MM:SS`.
@@ -214,7 +299,7 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
         conn.execute_unprepared(CREATE_TABLE_SQL)
             .await
             .context("failed to create the `tokens` table")?;
-        return Ok(());
+        return create_mrs_table(conn).await;
     }
 
     let has_id = conn
@@ -228,7 +313,7 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
     if has_id {
         // v0.2: tokens gained a bound config served by `/convert`.
         add_config_column_if_missing(conn).await?;
-        return Ok(());
+        return create_mrs_table(conn).await;
     }
 
     tracing::info!("Migrating the `tokens` table to the new schema");
@@ -249,6 +334,14 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
             .context("failed to migrate the `tokens` table")?;
     }
 
+    create_mrs_table(conn).await
+}
+
+/// Create the `mrs_files` table on databases that predate it.
+async fn create_mrs_table(conn: &DatabaseConnection) -> Result<()> {
+    conn.execute_unprepared(CREATE_MRS_TABLE_SQL)
+        .await
+        .context("failed to create the `mrs_files` table")?;
     Ok(())
 }
 

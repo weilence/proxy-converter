@@ -1,4 +1,4 @@
-import type { TokenInfo } from './types'
+import type { MrsConvertResult, TokenInfo } from './types'
 
 export class ApiError extends Error {
   constructor(
@@ -78,7 +78,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ config }),
     })
-    if (!res.ok) throw new ApiError(res.status, await errorText(res, `保存失败 (${res.status})`))
+    if (!res.ok) throw new ApiError(res.status, await errorText(res, '保存失败'))
+  },
+
+  async setName(id: number, name: string): Promise<void> {
+    const res = await request(`/admin/api/tokens/${id}/name`, {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    })
+    if (!res.ok) throw new ApiError(res.status, await errorText(res, '保存失败'))
+  },
+
+  async convertMrs(id: number, baseUrl: string): Promise<MrsConvertResult> {
+    const res = await request(`/admin/api/tokens/${id}/convert-mrs`, {
+      method: 'POST',
+      body: JSON.stringify({ base_url: baseUrl }),
+    })
+    if (!res.ok) throw new ApiError(res.status, await errorText(res, '转换失败'))
+    return res.json()
   },
 
   async setEnabled(id: number, enabled: boolean): Promise<void> {
