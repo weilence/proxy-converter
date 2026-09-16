@@ -41,6 +41,16 @@ async function toggleEnabled(row: TokenInfo) {
   emit('reload')
 }
 
+async function copyConfigUrl(row: TokenInfo) {
+  const url = `${window.location.origin}/config?token=${encodeURIComponent(row.token)}`
+  try {
+    await navigator.clipboard.writeText(url)
+    toast.add({ title: '配置链接已复制', color: 'success' })
+  } catch {
+    toast.add({ title: '复制失败，请手动复制', color: 'error' })
+  }
+}
+
 const deleting = ref<TokenInfo | null>(null)
 const removing = ref(false)
 const deleteOpen = computed({
@@ -104,6 +114,15 @@ const columns: TableColumn<TokenInfo>[] = [
       </template>
       <template #actions-cell="{ row }">
         <div class="flex gap-1.5">
+          <UTooltip text="复制配置链接">
+            <UButton
+              size="xs"
+              color="neutral"
+              variant="soft"
+              icon="i-lucide-link"
+              @click="copyConfigUrl(row.original)"
+            />
+          </UTooltip>
           <UButton size="xs" color="neutral" variant="soft" @click="emit('edit', row.original)">
             修改
           </UButton>
