@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 mime_guess = "2"
 percent-encoding = "2"
+rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rust-embed = "8"
 sea-orm = { version = "1.1", default-features = false, features = ["macros", "runtime-tokio", "sqlx-sqlite", "with-chrono"] }

@@ -51,6 +51,31 @@ async function copyConfigUrl(row: TokenInfo) {
   }
 }
 
+const duplicating = ref<TokenInfo | null>(null)
+const duplicatingBusy = ref(false)
+const dupOpen = computed({
+  get: () => duplicating.value !== null,
+  set: (value) => {
+    if (!value) duplicating.value = null
+  },
+})
+
+async function duplicate() {
+  const row = duplicating.value
+  if (!row || duplicatingBusy.value) return
+  duplicatingBusy.value = true
+  try {
+    const created = await api.duplicateToken(row.id)
+    toast.add({ title: `已复制，新令牌：${created.token}`, color: 'success' })
+    duplicating.value = null
+    emit('reload')
+  } catch (err) {
+    toast.add({ title: describe(err, '复制失败'), color: 'error' })
+  } finally {
+    duplicatingBusy.value = false
+  }
+}
+
 const deleting = ref<TokenInfo | null>(null)
 const removing = ref(false)
 const deleteOpen = computed({
@@ -132,6 +157,9 @@ const columns: TableColumn<TokenInfo>[] = [
           <UButton size="xs" color="neutral" variant="soft" @click="geoConverting = row.original">
             转 Geo
           </UButton>
+          <UButton size="xs" color="neutral" variant="soft" @click="duplicating = row.original">
+            复制
+          </UButton>
           <UButton size="xs" color="neutral" variant="soft" @click="toggleEnabled(row.original)">
             {{ row.original.status === 'disabled' ? '启用' : '停用' }}
           </UButton>
@@ -154,6 +182,19 @@ const columns: TableColumn<TokenInfo>[] = [
         <div class="flex w-full justify-end gap-2">
           <UButton color="neutral" variant="soft" @click="deleteOpen = false">取消</UButton>
           <UButton color="error" :loading="removing" @click="remove">删除</UButton>
+        </div>
+      </template>
+    </UModal>
+
+    <UModal
+      v-model:open="dupOpen"
+      title="复制令牌"
+      :description="`将为令牌「${duplicating?.token}」生成一个新令牌，复制其配置和已托管的 mrs/geo 文件，配置中的下载链接会改写为新令牌。`"
+    >
+      <template #footer>
+        <div class="flex w-full justify-end gap-2">
+          <UButton color="neutral" variant="soft" @click="dupOpen = false">取消</UButton>
+          <UButton :loading="duplicatingBusy" @click="duplicate">复制</UButton>
         </div>
       </template>
     </UModal>

@@ -2,6 +2,7 @@ use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context as _, Result};
 use chrono::{Local, Utc};
+use percent_encoding::utf8_percent_encode;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, Database, DatabaseBackend,
     DatabaseConnection, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, Set, Statement,
@@ -80,26 +81,15 @@ impl Db {
         found
     }
 
-    /// Insert a token; returns `false` when it already exists.
-    pub async fn add(
-        &self,
-        token: &str,
-        name: &str,
-        days: Option<i64>,
-        config: &str,
-    ) -> Result<bool> {
+    /// Insert a token with a freshly generated random value; returns the new
+    /// record.
+    pub async fn add(&self, name: &str, days: Option<i64>, config: &str) -> Result<token::Model> {
         let config = normalize_config(config)?;
-        if token::Entity::find()
-            .filter(token::Column::Token.eq(token))
-            .one(&self.conn)
-            .await
-            .is_ok_and(|record| record.is_some())
-        {
-            return Ok(false);
-        }
+        let txn = self.conn.begin().await?;
+        let token = unused_token(&txn).await?;
 
-        token::ActiveModel {
-            token: Set(token.to_owned()),
+        let inserted = token::ActiveModel {
+            token: Set(token),
             name: Set(name.to_owned()),
             config: Set(config),
             enabled: Set(true),
@@ -108,11 +98,12 @@ impl Db {
             last_used_at: Set(None),
             ..Default::default()
         }
-        .insert(&self.conn)
+        .insert(&txn)
         .await
-        .map_err(|err| anyhow::anyhow!("failed to insert the token: {err}"))?;
+        .context("failed to insert the token")?;
 
-        Ok(true)
+        txn.commit().await?;
+        Ok(inserted)
     }
 
     /// Fetch a token by id.
@@ -121,6 +112,51 @@ impl Db {
             .one(&self.conn)
             .await
             .context("failed to fetch the token")
+    }
+
+    /// Duplicate a token: a fresh random token value with the same name,
+    /// expiry and config, plus copies of all its hosted files. Hosted links
+    /// inside the config are re-pointed at the new token value, so the copy
+    /// keeps working if the source is later deleted or disabled. The copy
+    /// starts enabled and unused; returns the new record, or `None` when the
+    /// source token does not exist.
+    pub async fn duplicate(&self, id: i32) -> Result<Option<token::Model>> {
+        let txn = self.conn.begin().await?;
+        let Some(source) = token::Entity::find_by_id(id)
+            .one(&txn)
+            .await
+            .context("failed to fetch the token")?
+        else {
+            return Ok(None);
+        };
+        let new_token = unused_token(&txn).await?;
+        let new_config = swap_token_in_config(&source.config, &source.token, &new_token);
+
+        let inserted = token::ActiveModel {
+            token: Set(new_token),
+            name: Set(source.name.clone()),
+            config: Set(new_config),
+            enabled: Set(true),
+            expires_at: Set(source.expires_at),
+            created_at: Set(now()),
+            last_used_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await
+        .context("failed to insert the token")?;
+
+        txn.execute_unprepared(&format!(
+            "INSERT INTO hosted_files (token_id, name, source_url, content, updated_at)
+             SELECT {}, name, source_url, content, updated_at
+             FROM hosted_files WHERE token_id = {}",
+            inserted.id, source.id
+        ))
+        .await
+        .context("failed to copy the token's hosted files")?;
+
+        txn.commit().await?;
+        Ok(Some(inserted))
     }
 
     /// Delete a token by id along with its hosted files; returns the number
@@ -292,6 +328,51 @@ async fn delete_hosted_files(txn: &DatabaseTransaction, token_id: i32) -> Result
         .context("failed to delete the token's hosted files")
 }
 
+/// Re-point hosted download links at a new token value: rewrite every
+/// `token=<old>` occurrence in the config, in raw or percent-encoded form
+/// (the form `download_url` writes).
+fn swap_token_in_config(config: &str, old: &str, new: &str) -> String {
+    let encode = |value: &str| utf8_percent_encode(value, crate::mrs::URL_SAFE).to_string();
+    let mut swapped = config.replace(&format!("token={old}"), &format!("token={new}"));
+    let (encoded_old, encoded_new) = (encode(old), encode(new));
+    if encoded_old != old {
+        swapped = swapped.replace(
+            &format!("token={encoded_old}"),
+            &format!("token={encoded_new}"),
+        );
+    }
+    swapped
+}
+
+/// Alphabet for generated tokens: URL-safe, 6 bits of entropy per character.
+const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const TOKEN_LENGTH: usize = 16;
+
+/// A random URL-safe token value, 96 bits of entropy.
+fn generate_token() -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    (0..TOKEN_LENGTH)
+        .map(|_| TOKEN_ALPHABET[rng.random_range(0..TOKEN_ALPHABET.len())] as char)
+        .collect()
+}
+
+/// A generated token value not yet present in the database.
+async fn unused_token(txn: &DatabaseTransaction) -> Result<String> {
+    loop {
+        let candidate = generate_token();
+        let taken = token::Entity::find()
+            .filter(token::Column::Token.eq(&candidate))
+            .one(txn)
+            .await
+            .context("failed to check the token value")?
+            .is_some();
+        if !taken {
+            return Ok(candidate);
+        }
+    }
+}
+
 /// Current UTC time; stored as `YYYY-MM-DD HH:MM:SS`.
 pub fn now() -> DateTime {
     Utc::now().naive_utc()
@@ -337,6 +418,30 @@ fn normalize_config(config: &str) -> Result<String> {
     Ok(config.to_owned())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swap_token_rewrites_raw_and_encoded_links() {
+        let config = "\
+rule-providers:
+  a:
+    url: http://h/files/a.mrs?token=tok+1
+geox-url:
+  geoip: http://h/files/geoip?token=tok%2B1
+unrelated:
+  secret: token=other-value
+";
+        let swapped = swap_token_in_config(config, "tok+1", "new");
+        assert!(swapped.contains("a.mrs?token=new"));
+        assert!(swapped.contains("geoip?token=new"));
+        // Different token values stay untouched.
+        assert!(swapped.contains("token=other-value"));
+        assert!(!swapped.contains("tok%2B1"));
+    }
+}
+
 /// Create the table for fresh databases, or upgrade the legacy schema
 /// (token as primary key, unix-epoch integers) to the current one.
 async fn migrate(conn: &DatabaseConnection) -> Result<()> {
@@ -366,7 +471,7 @@ async fn migrate(conn: &DatabaseConnection) -> Result<()> {
         .is_some();
 
     if has_id {
-        // v0.2: tokens gained a bound config served by `/convert`.
+        // v0.2: tokens gained a bound config.
         add_config_column_if_missing(conn).await?;
         return create_hosted_table(conn).await;
     }

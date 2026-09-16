@@ -68,6 +68,7 @@ pub fn routes() -> Router<AppState> {
             "/admin/api/tokens/{id}/convert-geo",
             post(convert_token_geo),
         )
+        .route("/admin/api/tokens/{id}/duplicate", post(duplicate_token))
         .route("/admin/api/tokens/{id}", delete(remove_token));
 
     #[cfg(not(debug_assertions))]
@@ -202,12 +203,12 @@ async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
 #[derive(Deserialize)]
 struct AddTokenPayload {
-    token: String,
     name: Option<String>,
     days: Option<i64>,
     config: Option<String>,
 }
 
+/// Create a token; the token value is generated server-side and returned.
 async fn add_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -217,10 +218,6 @@ async fn add_token(
         return response;
     }
 
-    let token = payload.token.trim().to_owned();
-    if token.is_empty() {
-        return (StatusCode::BAD_REQUEST, "token must not be empty").into_response();
-    }
     if payload.days.is_some_and(|days| days < 0) {
         return (StatusCode::BAD_REQUEST, "days must not be negative").into_response();
     }
@@ -230,9 +227,8 @@ async fn add_token(
     if let Err(err) = db::validate_config(config.trim()) {
         return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
     }
-    match state.db.add(&token, &name, payload.days, &config).await {
-        Ok(true) => (StatusCode::CREATED, "added").into_response(),
-        Ok(false) => (StatusCode::CONFLICT, "token already exists").into_response(),
+    match state.db.add(&name, payload.days, &config).await {
+        Ok(record) => (StatusCode::CREATED, Json(TokenJson::from_record(&record))).into_response(),
         Err(err) => internal(err),
     }
 }
@@ -576,6 +572,26 @@ async fn remove_token(
     match state.db.remove(id).await {
         Ok(0) => (StatusCode::NOT_FOUND, "token not found").into_response(),
         Ok(_) => (StatusCode::OK, "ok").into_response(),
+        Err(err) => internal(err),
+    }
+}
+
+/// Duplicate a token with its config and hosted files; the config's hosted
+/// download links are re-pointed at the new token value.
+async fn duplicate_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i32>,
+) -> Response {
+    if let Err(response) = guard(&state, &headers) {
+        return response;
+    }
+
+    match state.db.duplicate(id).await {
+        Ok(Some(record)) => {
+            (StatusCode::CREATED, Json(TokenJson::from_record(&record))).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "token not found").into_response(),
         Err(err) => internal(err),
     }
 }

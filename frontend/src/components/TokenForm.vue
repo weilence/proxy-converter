@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { api, ApiError } from '../api/client'
+import { api } from '../api/client'
 
 const emit = defineEmits<{ added: [] }>()
 const toast = useToast()
@@ -10,37 +10,23 @@ const days = ref<number | null>(null)
 const config = ref('')
 const submitting = ref(false)
 
-/** Random URL-safe token, 6 bits of entropy per character. */
-function generateToken(length = 16): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
-  const bytes = crypto.getRandomValues(new Uint8Array(length))
-  return [...bytes].map((byte) => alphabet[byte & 63]).join('')
-}
-
 async function submit() {
   if (submitting.value) return
 
   submitting.value = true
   try {
-    await api.addToken({
-      token: generateToken(),
+    const created = await api.addToken({
       name: name.value.trim(),
       days: days.value,
       config: config.value.trim(),
     })
-    toast.add({ title: '令牌已添加', color: 'success' })
+    toast.add({ title: `令牌已添加：${created.token}`, color: 'success' })
     name.value = ''
     days.value = null
     config.value = ''
     emit('added')
   } catch (err) {
-    const message
-      = err instanceof ApiError && err.status === 409
-        ? '令牌已存在'
-        : err instanceof Error
-          ? err.message
-          : '添加失败'
-    toast.add({ title: message, color: 'error' })
+    toast.add({ title: err instanceof Error ? err.message : '添加失败', color: 'error' })
   } finally {
     submitting.value = false
   }

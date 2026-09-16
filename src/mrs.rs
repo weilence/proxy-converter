@@ -558,7 +558,7 @@ pub fn rewrite_config(
 }
 
 /// Unreserved URL characters (RFC 3986); safe for path segments and queries.
-const URL_SAFE: &AsciiSet = &NON_ALPHANUMERIC
+pub(crate) const URL_SAFE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
     .remove(b'_')

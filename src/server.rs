@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::{Context as _, Result};
 use axum::{
     Router,
-    extract::{Path, Query, RawQuery, State},
+    extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -33,10 +33,7 @@ pub async fn run(addr: SocketAddr, database: PathBuf) -> Result<()> {
 
     let app = Router::new()
         .route("/config", get(config))
-        .route("/convert", get(convert))
         .route("/files/{name}", get(file))
-        // Legacy alias kept for configs rewritten before the generic endpoint.
-        .route("/mrs/{name}", get(file))
         .merge(crate::admin::routes())
         .with_state(state);
 
@@ -73,18 +70,6 @@ async fn config(
     Ok(config_response(record.config.trim().to_owned()))
 }
 
-/// `/convert` is deprecated; redirect to `/config`, preserving the query.
-async fn convert(RawQuery(query): RawQuery) -> Response {
-    let location = match query.filter(|query| !query.is_empty()) {
-        Some(query) => format!("/config?{query}"),
-        None => "/config".to_owned(),
-    };
-    match HeaderValue::from_str(&location) {
-        Ok(location) => (StatusCode::FOUND, [(header::LOCATION, location)]).into_response(),
-        Err(_) => (StatusCode::FOUND, "moved to /config").into_response(),
-    }
-}
-
 #[derive(Deserialize)]
 struct MrsParams {
     token: Option<String>,
@@ -92,7 +77,7 @@ struct MrsParams {
 
 /// Serve one of the token's hosted files, e.g. `/files/google.mrs` or
 /// `/files/geoip`. The file set is private per token: names never collide
-/// across tokens. `/mrs/{name}` is a legacy alias of this handler.
+/// across tokens.
 async fn file(
     State(state): State<AppState>,
     Path(name): Path<String>,

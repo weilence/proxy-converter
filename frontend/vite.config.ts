@@ -23,7 +23,7 @@ export default defineConfig({
     proxy: {
       '/admin/api': 'http://127.0.0.1:8080',
       '/config': 'http://127.0.0.1:8080',
-      '/mrs': 'http://127.0.0.1:8080',
+      '/files': 'http://127.0.0.1:8080',
     },
   },
 })

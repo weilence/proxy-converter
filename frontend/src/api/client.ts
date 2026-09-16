@@ -60,17 +60,18 @@ export const api = {
     return res.json()
   },
 
+  /** Create a token; the token value is generated server-side. */
   async addToken(input: {
-    token: string
     name: string
     days: number | null
     config: string
-  }): Promise<void> {
+  }): Promise<TokenInfo> {
     const res = await request('/admin/api/tokens', {
       method: 'POST',
       body: JSON.stringify(input),
     })
     if (!res.ok) throw new ApiError(res.status, await errorText(res, `添加失败 (${res.status})`))
+    return res.json()
   },
 
   async setConfig(id: number, config: string): Promise<void> {
@@ -104,6 +105,13 @@ export const api = {
       body: JSON.stringify({ base_url: baseUrl }),
     })
     if (!res.ok) throw new ApiError(res.status, await errorText(res, '转换失败'))
+    return res.json()
+  },
+
+  /** Duplicate a token with its config and hosted files. */
+  async duplicateToken(id: number): Promise<TokenInfo> {
+    const res = await request(`/admin/api/tokens/${id}/duplicate`, { method: 'POST' })
+    if (!res.ok) throw new ApiError(res.status, await errorText(res, '复制失败'))
     return res.json()
   },
 
