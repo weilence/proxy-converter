@@ -19,7 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Delete untagged versions older than 1 day
-        uses: snok/container-retention-policy@v3
+        # v3 系列没有维护 "v3" 移动 tag,只能用完整版本号
+        uses: snok/container-retention-policy@v3.1.0
         with:
           # literal "user" = personal account packages
           account: user
